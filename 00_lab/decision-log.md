@@ -1,7 +1,10 @@
-# سجل القرارات (Decision Log)
+# Decision Log — سجل القرارات العلمية والمنهجية
 
-| التاريخ | القرار | السبب | البدائل المرفوضة | الأثر |
-|---------|--------|-------|------------------|-------|
-| 2026-09-11 | إنشاء المستودع ووضع الأوراق الخمسة | بداية Sprint 01 | — | — |
-
-> القاعدة: أي قرار مؤثر يُسجل هنا **قبل** تنفيذه، مع سبب الرفض للبدائل.
+| Date | Decision | Scientific Rationale | Rejected Alternatives | Impact / Artifacts |
+|---|---|---|---|---|
+| 2026-09-11 | Repository initialization and initial literature ingestion | Beginning of Sprint 01 | — | Base directory structure created |
+| 2026-10-07 | Rescission of Stale R6.7 Synthesis and Premature R7 Parameters | Prior R6.7 was evaluated against a stale 18-paper snapshot (`f403978`), missing 21 physical PDFs (53.8% of corpus) merged at commit `7f7b110`. | Validating prior R6.7; Proceeding with unverified gaps. | All R7 frozen parameters (STM32F103, 20 kB SRAM, CWRU splits) rescinded. Corpus expanded to 39 physical files / 36 unique works. |
+| 2026-10-07 | Neutral Research Question Evaluation & Discrimination Gate | Re-evaluation of all candidate research directions (C1–C6 + C7/C8) using strict physical identifiability and falsifiability. | Selecting RD1 as default winner; selecting based on implementation ease. | Gate Decision C: Two candidates survived (Candidate A: C2/C7 Streaming Adaptation; Candidate B: C5/C8 Cross-Machine Invariance). |
+| 2026-10-07 | Dataset Harmonization & Feasibility Audit | Audited 8 rotating machinery dataset families for temporal continuity, tachometer tracks, and cross-machine transferability. | Concatenating static CWRU/SEU files for streaming claims; Random window splitting across same bearings. | Identified that CWRU concatenation creates artificial phase jumps. Verified CWRU ↔ Paderborn ↔ SEU triad for cross-machine evaluation. |
+| 2026-10-07 | Formal Ratification of Candidate B (C5/C8) as Primary Research Direction | Candidate B directly attacks the fundamental physical cause of cross-bearing model collapse (casing transfer function $h(t)$ convolution). Candidate A deferred due to unavoidable timescale confounding ($\tau_{\text{fault}} \approx \tau_{\text{drift}}$). | Ratifying Candidate A as primary; Rejecting both directions. | Candidate B ratified as the laboratory's primary scientific question. Candidate A deferred for future streaming telemetry. |
+| 2026-10-07 | Protocol Design Gate Freeze (C5/C8) | Resolved all three technical closures (A: 1X IDFT speed estimation on CWRU; B: SEU gear-mesh envelope isolation; C: Analytical $\le 8.2\text{ kB}$ order resampling buffer). | Proceeding without resolving CWRU speed estimation error; omitting gear-mesh demodulation. | Scientific Protocol Charter formally frozen for subsequent experimental execution. |
