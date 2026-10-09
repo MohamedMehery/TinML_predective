@@ -70,6 +70,38 @@ else:
     )
 
 
+class _PerRunWriter:
+    """Incremental CSV writer for the per-(rep, fold, seed) rows.
+
+    The header is written when the writer is opened. Each call to
+    `write_row` appends one row and `flush`-es the underlying file
+    handle so that an interrupted process leaves the work-so-far
+    on disk.
+    """
+
+    def __init__(self, path: str, fieldnames: list[str]):
+        import csv as _csv
+        self.path = path
+        self._fh = open(path, "w", newline="", buffering=1)  # line-buffered
+        self._writer = _csv.DictWriter(self._fh, fieldnames=fieldnames)
+        self._writer.writeheader()
+
+    def write_row(self, row: dict) -> None:
+        self._writer.writerow(row)
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.flush()
+            self._fh.close()
+        except Exception:
+            pass
+
+
+class _PerUidWriter(_PerRunWriter):
+    """Same protocol as _PerRunWriter, separate file."""
+
+
 # Frozen config keys we read directly (avoid loading the JSON here to
 # keep the import surface small).
 DEFAULT_SEEDS = (42, 1337, 2026, 7, 99)
@@ -107,6 +139,8 @@ def _run_one_transfer(
     seeds: list[int],
     source_folds: int | None,
     bootstrap_n: int,
+    per_run_writer: "_PerRunWriter | None" = None,
+    per_uid_writer: "_PerUidWriter | None" = None,
 ) -> dict:
     """Run all (representation, source-LOBO-fold, seed) combinations.
 
@@ -178,6 +212,8 @@ def _run_one_transfer(
                     "macro_f1_std": std_f1,
                     "elapsed_sec": round(elapsed, 2),
                 })
+                if per_run_writer is not None:
+                    per_run_writer.write_row(per_run[-1])
                 # Per-UID F1 for the target (used by the LME and the
                 # reviewer's "is the collapse uniform across UIDs?" check).
                 per_uid_f1 = ev_mod.per_uid_macro_f1(yt, y_pred, ut)
@@ -189,6 +225,8 @@ def _run_one_transfer(
                         "target_uid": uid,
                         "macro_f1": f1,
                     })
+                    if per_uid_writer is not None:
+                        per_uid_writer.write_row(per_uid[-1])
 
                 print(
                     f"  [rep={rep:>8}] fold={fold_idx} test_uid={test_uid:>13} "
@@ -261,34 +299,50 @@ def main(argv: list[str] | None = None) -> int:
           f"{target.r1_raw.shape} R1, {target.r3_order.shape} R3")
     print()
 
-    result = _run_one_transfer(
-        source, target,
-        representations=args.representations,
-        seeds=args.seeds,
-        source_folds=args.source_folds,
-        bootstrap_n=args.bootstrap_n,
-    )
-
-    # Write outputs.
-    import csv
-
+    # Open the per-row CSV writers *before* running any training. Each
+    # row is flushed incrementally so that an interrupted process
+    # leaves the work-so-far on disk (see commit 30c495c and the
+    # prior interruption at 32/175 runs).
+    per_run_fields = [
+        "representation", "source_fold_idx", "source_test_uid", "seed",
+        "n_source_train", "n_target_test",
+        "macro_f1_point", "macro_f1_ci_lo", "macro_f1_ci_hi", "macro_f1_std",
+        "elapsed_sec",
+    ]
+    per_uid_fields = [
+        "representation", "source_fold_idx", "seed", "target_uid", "macro_f1",
+    ]
     per_run_path = os.path.join(out_dir, "PILOT_T12_per_run.csv")
-    with open(per_run_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(result["per_run"][0].keys()))
-        w.writeheader()
-        w.writerows(result["per_run"])
-    print(f"\nWrote {per_run_path}  ({len(result['per_run'])} rows)")
-
     per_uid_path = os.path.join(out_dir, "PILOT_T12_per_uid_f1.csv")
-    with open(per_uid_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(result["per_uid"][0].keys()))
-        w.writeheader()
-        w.writerows(result["per_uid"])
+    per_run_writer = _PerRunWriter(per_run_path, per_run_fields)
+    per_uid_writer = _PerUidWriter(per_uid_path, per_uid_fields)
+    print(f"Opened {per_run_path} (incremental flush per row)")
+    print(f"Opened {per_uid_path} (incremental flush per row)")
+
+    try:
+        result = _run_one_transfer(
+            source, target,
+            representations=args.representations,
+            seeds=args.seeds,
+            source_folds=args.source_folds,
+            bootstrap_n=args.bootstrap_n,
+            per_run_writer=per_run_writer,
+            per_uid_writer=per_uid_writer,
+        )
+    finally:
+        per_run_writer.close()
+        per_uid_writer.close()
+    print(f"\nWrote {per_run_path}  ({len(result['per_run'])} rows)")
     print(f"Wrote {per_uid_path}  ({len(result['per_uid'])} rows)")
 
+    # Summary and meta only depend on the per-row grids and are
+    # written once at the end. If the run was interrupted before
+    # these are produced, the per-run CSV is still the canonical
+    # source of truth and a downstream script can re-aggregate.
     summary_path = os.path.join(out_dir, "PILOT_T12_summary.csv")
     with open(summary_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(result["summary"][0].keys()))
+        import csv as _csv
+        w = _csv.DictWriter(f, fieldnames=list(result["summary"][0].keys()))
         w.writeheader()
         w.writerows(result["summary"])
     print(f"Wrote {summary_path}  ({len(result['summary'])} rows)")
