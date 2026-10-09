@@ -1,7 +1,7 @@
-# سجل التجارب
+# Experiment Log
 
-| التجربة | السؤال | البيانات | Baseline | النموذج | النتيجة | Failed? | ماذا تعلمنا |
-|---------|--------|----------|----------|---------|---------|---------|--------------|
-| 001-thermal-audit | هل إنذارات رحلة حرارة الزيت (OTI_T) تمثل تدهوراً حرارياً فيزيائياً يمكن التنبؤ به؟ | Overview.csv + CurrentVoltage.csv (19.3k rows) | IEC 60076-7 Top-Oil ODE (Validation RMSE 1.44°C) | Physics Residual Innovation Filter | فشل افتراض التدهور: OTI_T مجرد عتبة >= 236°C (فجوة تامة عبر 166°C بـ 0 عينة)، والتبريد من 248 لـ 52 في 8 دقائق يتطلب 233 kW مستحيلة في ONAN | نعم (Negative Result قاطعة) | التنبؤ بـ OTI_T بالذكاء الاصطناعي مغالطة لأن الحدث عطل إلكتروني في دارة الحساس. الحل الصحيح لـ TinyML هو فلتر كشف عطل الحساس بمعدل التغير (معاير عند p99.9 = 2.0°C/min). |
+| Experiment | Question | Data | Baseline | Model | Result | Failed? | What we learned |
+|------------|----------|------|----------|-------|--------|---------|-----------------|
+| 001-thermal-audit | Do transformer oil-temperature trip alarms (OTI_T) represent a physically predictable thermal degradation? | Overview.csv + CurrentVoltage.csv (19.3k rows) | IEC 60076-7 Top-Oil ODE (Validation RMSE 1.44°C) | Physics Residual Innovation Filter | The degradation assumption failed: OTI_T is just a threshold >= 236°C (a complete gap across 166°C with 0 samples), and the cooling from 248 to 52 in 8 minutes requires 233 kW — physically impossible in ONAN. | Yes (decisive Negative Result) | Predicting OTI_T with AI is a fallacy because the event is an electronics fault in the sensor circuit. The correct TinyML solution is a rate-of-change sensor-fault detector (calibrated at p99.9 = 2.0°C/min). |
 
-> القاعدة: الفشل يُسجل بنفس أهمية النجاح. الـNegative Result مع التوثيق الجيد بحث محترم.
+> Rule: failure is logged with the same weight as success. A well-documented Negative Result is respectable research.

@@ -1,0 +1,53 @@
+Pre-execution validation log — EXP-C5C8-002
+============================================
+Date:    2026-10-09 (session local)
+Branch:  arena/6ad75829-tinml-predective
+HEAD:    128dda7b8acc5d645ff2556fd409b69e18e66e31
+Script:  validate_config.py (read-only)
+
+Stage 1a — JSON schema & type integrity
+---------------------------------------
+  [ok] all 9 required top-level keys present
+  [ok] experiment_id = 'EXP-C5C8-002'
+  [ok] random_seeds = [42, 1337, 2026, 7, 99] (5 unique integers)
+  [ok] target_fs_hz = 12000 Hz
+  [ok] resampling_method = polyphase_anti_alias, filter_order = 64
+  [ok] windowing: 2048 samples, hop 1024, Hann
+  [ok] bandpass: butterworth order 4, 500-5000 Hz
+  [ok] envelope: hilbert_magnitude, squared=False (DEVIATION: see Stage 1b)
+  [ok] shaft speed: idft_parabolic_interpolation on 2048-pt FFT, +/- 15.0 %
+  [ok] angular resampling: 64 samples/rev, up to order 16.0, linear
+  [ok] spectral transform: FFT length 2048, 1024 freq bins, 512 order bins
+  [ok] representations: R1_Raw, R1_Env, R2_Raw, R2_Env, R3_Order (5)
+  [ok] R1_*: 1x2048 time-domain, 1D-CNN (Compact1DCNN_3Layer)
+  [ok] R2_*: 1024-bin frequency-domain, MLP (StandardMLP_2Layer)
+  [ok] R3_Order: 512->1024 zero-padded order envelope, MLP
+  [ok] training: AdamW lr=1e-3 wd=1e-4 bs=32 epochs=60 patience=12
+  [ok] normalization = 'source_train_zscore_only' (leakage prevention)
+  [ok] primary_unit = 'physical_bearing_uid'
+  [ok] cluster bootstrap n=10000, CI=0.95, effect=hedges_g
+  [ok] regression_model = 'linear_mixed_effects'
+
+Stage 1b — Cross-check against ratified C5/C8 charter
+-----------------------------------------------------
+  [ok] charter mentions CWRU, Paderborn, SEU
+  [WARN] charter specifies "Squared Hilbert Envelope" but config uses
+         "Hilbert magnitude" (squared=False).
+         Recorded deviation. Must be justified in src/preprocess.py and
+         NOTES.md when those are drafted. Ablation on squared-vs-magnitude
+         is required on the CWRU subset before results are trusted.
+  [ok] charter requires physical-bearing-level unit of analysis
+  [ok] charter pins <= 8.2 kB working RAM, <= 10.5 kB Flash, <= 71 kOps/inference
+  [ok] decision log formally ratifies Candidate B (C5/C8) as primary
+  [ok] paper matrix lists CWRU (P15, P16, P20, P38), PU (P16), SEU (P27)
+
+Stage 2 — Workspace safety
+--------------------------
+  [ok] HEAD on arena/6ad75829-tinml-predective (session-pinned)
+  [ok] working tree: 1 untracked entry (the new config)
+  [ok] target folder did not previously exist; clean slate
+  [ok] on-disk config parses and matches schema expectations
+
+Result: VALIDATION PASSED
+  Proceed to file write + commit + push.
+  One deviation (Squared vs. magnitude envelope) recorded for follow-up.

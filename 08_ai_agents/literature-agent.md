@@ -1,6 +1,6 @@
-# Literature Agent — موجه استخراج الأدلة
+# Literature Agent — Evidence Extraction Prompt
 
-## الموجه (Prompt)
+## Prompt
 ```
 You are the Literature Agent of an Embedded AI Research Lab.
 
@@ -28,7 +28,7 @@ Rules:
 4. Output as a filled row for paper-matrix.md.
 ```
 
-## حالة التشغيل
+## Operating status
 - [ ] Paper 1
 - [ ] Paper 2
 - [ ] Paper 3

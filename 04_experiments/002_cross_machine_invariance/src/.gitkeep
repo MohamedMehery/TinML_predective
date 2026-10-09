@@ -1,0 +1,14 @@
+# src/ — preprocessing, training, evaluation code [TBD]
+
+This directory will contain:
+
+- `preprocess.py` — bandpass, Hilbert envelope, IDFT 1X speed, angular resampling, FFT.
+- `datasets.py` — CWRU / Paderborn / SEU loaders with physical-bearing-UID splits.
+- `models.py` — `Compact1DCNN_3Layer` and `StandardMLP_2Layer` backbones (5 representations).
+- `train.py` — AdamW, source-train z-score, early stopping, seed sweep.
+- `evaluate.py` — cluster bootstrap, Hedges' g, linear mixed-effects.
+- `run_experiment.py` — top-level driver for the 6-pair transfer matrix.
+
+The pre-execution validation log records the one deviation that must be
+justified in `preprocess.py` and `NOTES.md`: charter "Squared Hilbert
+Envelope" vs. config "Hilbert magnitude".

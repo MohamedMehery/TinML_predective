@@ -1,4 +1,4 @@
-# Decision Log — سجل القرارات العلمية والمنهجية
+# Decision Log — Record of Scientific and Methodological Decisions
 
 | Date | Decision | Scientific Rationale | Rejected Alternatives | Impact / Artifacts |
 |---|---|---|---|---|
