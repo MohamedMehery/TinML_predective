@@ -1,0 +1,18 @@
+# Pilot Results — placeholder
+
+This directory will contain `PILOT_*.json` outputs from the smoke-test
+runs of the pipeline against the synthetic data. Files in this directory
+are **not** part of the C5/C8 evidence base and are never cited as
+Experiment 002 results.
+
+Planned layout (defined when `src/evaluate.py` lands and is run against
+`../synthetic/raw_data/`):
+
+```
+PILOT_R1_Raw_transfer.json
+PILOT_R1_Env_transfer.json
+PILOT_R2_Raw_transfer.json
+PILOT_R2_Env_transfer.json
+PILOT_R3_Order_transfer.json
+PILOT_pipeline_sanity.json     # IDFT 1X tracker convergence, window counts, etc.
+```

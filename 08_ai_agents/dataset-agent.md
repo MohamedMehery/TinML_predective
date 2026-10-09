@@ -1,6 +1,6 @@
 # Dataset Agent
 
-## الموجه (Prompt)
+## Prompt
 ```
 You are the Dataset Hunter. Your job is NOT to find datasets only —
 it is to determine whether a research question is experimentally feasible.
@@ -19,7 +19,13 @@ Rules:
 - Always propose at least one fallback dataset.
 ```
 
-## مهمات حالية
-- [ ] رصد datasets الأوراق الخمسة
-- [ ] التحقق من إمكانية التنزيل
-- [ ] تقييم الجودة
+## Current tasks
+- [x] Survey the datasets of the ratified triad (CWRU ↔ PU ↔ SEU) — 2026-10-09,
+      ratification recorded in `00_lab/decision-log.md` row dated 2026-10-07.
+- [x] Write the detailed cards for the triad in `02_datasets/manifests/`
+      (files `cwru.md`, `paderborn.md`, `seu.md`).
+- [ ] Verify downloadability — fields tagged `[TO VERIFY FROM SOURCE DOC]`
+      in the three cards need manual verification from the provider's page
+      before `src/preprocess.py` is run.
+- [ ] Quality assessment — depends on the verification above; will be
+      recorded here when complete.
