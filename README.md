@@ -1,22 +1,22 @@
 # Embedded AI Research-to-Impact Lab
 
-Research Lab Notebook — TinyML + Predictive Maintenance (قابل لإعادة الاستخدام لأي موضوع Embedded AI).
+Research Lab Notebook — TinyML + Predictive Maintenance (reusable for any Embedded AI topic).
 
-## المبدأ الأساسي
-لا نبدأ بـ "ماذا نستطيع أن نبني؟" بل بـ "ما المشكلة العلمية غير المحلولة التي نستطيع إثباتها بالموارد المتاحة؟"
+## Core Principle
+We do not start with "What can we build?" — we start with "What unsolved scientific problem can we prove is solvable with the resources we have?"
 
-المسار: Research → Contribution → Prototype → Publication → Network → Opportunity
+Path: Research → Contribution → Prototype → Publication → Network → Opportunity
 
-## بنية المستودع
-- `00_lab/` — المبادئ، سير العمل، سجل القرارات
-- `01_literature/` — الأوراق، مصفوفة المقارنة، خريطة الأدبيات، التحليل النقدي
-- `02_datasets/` — سجل الـdatasets وبطاقاتها
-- `03_research_questions/` — الأسئلة المرشحة والمختار
-- `04_experiments/` — تجارب مرقمة (001, 002, ...)
+## Repository Structure
+- `00_lab/` — Principles, workflow, decision log
+- `01_literature/` — Papers, comparison matrix, literature map, critical analysis
+- `02_datasets/` — Dataset registry and per-dataset cards
+- `03_research_questions/` — Candidate and selected research questions
+- `04_experiments/` — Numbered experiments (001, 002, ...)
 - `05_embedded/` — STM32 / Zephyr / Wokwi / benchmarks
-- `06_results/` — أرقام، أشكال، سجل التجارب
-- `07_publication/` — تقارير، مقالات، عروض
-- `08_ai_agents/` — موجهات (Prompts) الوكلاء
+- `06_results/` — Numbers, figures, experiment log
+- `07_publication/` — Reports, articles, talks
+- `08_ai_agents/` — Agent prompts
 
-## قاعدة الالتزام (Commit Rule)
-كل ملف يُحدَّث = Commit واضح. سجل القرارات في `00_lab/decision-log.md` قبل أي خطوة كبيرة.
+## Commit Rule
+Every file that changes = one clear commit. Record decisions in `00_lab/decision-log.md` before any large step.
