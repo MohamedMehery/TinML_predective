@@ -24,7 +24,9 @@ def _format_text(report: dict) -> str:
         lines.append(f"    first/last timestamp: {ch['first_timestamp']} / {ch['last_timestamp']}")
         lines.append(f"    intervals (min/median/max): {ch['min_interval']} / {ch['median_interval']} / {ch['max_interval']}")
         lines.append(f"    non-positive diffs: {ch['nonpositive_diff_count']}")
-        lines.append(f"    conditional sample rate (if seconds): {ch['conditional_sample_rate_hz']} Hz")
+        lines.append(f"    endpoint rate (if seconds): {ch['endpoint_rate_hz']} Hz")
+        lines.append(f"    median-interval diagnostic rate (if seconds): {ch['median_interval_rate_hz']} Hz")
+        lines.append(f"    max abs timestamp residual: {ch['max_abs_residual_s']} s ({ch['max_abs_residual_us']} us)")
         lines.append(f"    status: {ch['validation_status']}")
         if ch["warnings"]:
             lines.append(f"    warnings: {ch['warnings']}")

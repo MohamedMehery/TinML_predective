@@ -367,6 +367,46 @@ def _intervals(t: "np.ndarray") -> Tuple[float, float, float, int]:
     return float(np.min(pos)), float(np.median(pos)), float(np.max(pos)), nonpos
 
 
+def endpoint_rate(timestamps: "np.ndarray") -> float:
+    """Endpoint-derived approximate rate: (N-1)/(t_last - t_first).
+
+    Conditional on timestamps being in seconds. Returns nan if invalid.
+    """
+    t = np.asarray(timestamps).ravel()
+    if t.size < 2:
+        return float("nan")
+    elapsed = float(t[-1] - t[0])
+    if elapsed <= 0:
+        return float("nan")
+    return float((t.size - 1) / elapsed)
+
+
+def median_interval_rate(timestamps: "np.ndarray") -> float:
+    """Diagnostic rate: 1 / median(diff(t)). Conditional on seconds."""
+    t = np.asarray(timestamps).ravel()
+    if t.size < 2:
+        return float("nan")
+    med = float(np.median(np.diff(t)))
+    if med <= 0 or not np.isfinite(med):
+        return float("nan")
+    return float(1.0 / med)
+
+
+def timestamp_residuals(timestamps: "np.ndarray") -> "np.ndarray":
+    """Residuals t[i] - (t[0] + i/f_endpoint), diagnostic only.
+
+    Does not modify the input. Returns empty array if invalid.
+    """
+    t = np.asarray(timestamps).ravel()
+    if t.size < 2:
+        return np.array([], dtype=float)
+    fe = endpoint_rate(t)
+    if not np.isfinite(fe) or fe <= 0:
+        return np.array([], dtype=float)
+    grid = t[0] + np.arange(t.size) / fe
+    return (t - grid).astype(float)
+
+
 def inspect_mat(path: str) -> Dict[str, Any]:
     """Produce a small inspection report for a MAT file."""
     result = read_mat(path)
@@ -374,10 +414,12 @@ def inspect_mat(path: str) -> Dict[str, Any]:
     for name, ch in result["channels"].items():
         t = ch.timestamps
         vmin, vmed, vmax, nonpos = _intervals(t)
-        if t.size >= 2 and vmed and not math.isnan(vmed) and vmed > 0:
-            rate = 1.0 / vmed
+        fe = endpoint_rate(t)
+        res = timestamp_residuals(t)
+        if res.size:
+            max_abs_res = float(np.max(np.abs(res)))
         else:
-            rate = float("nan")
+            max_abs_res = float("nan")
         channels_report[name] = {
             "name": name,
             "source_metadata": f"Y entry Name={name!r}, XIndex={ch.x_index} "
@@ -394,8 +436,13 @@ def inspect_mat(path: str) -> Dict[str, Any]:
             "median_interval": vmed,
             "max_interval": vmax,
             "nonpositive_diff_count": nonpos,
-            "conditional_sample_rate_hz": rate,
-            "sample_rate_note": "valid only if timestamps are in seconds",
+            "endpoint_rate_hz": fe,
+            "median_interval_rate_hz": median_interval_rate(t),
+            "max_abs_residual_s": max_abs_res,
+            "max_abs_residual_us": max_abs_res * 1e6 if np.isfinite(max_abs_res) else float("nan"),
+            "sample_rate_note": "rates conditional on timestamps being in seconds; "
+            "endpoint_rate_hz=(N-1)/(t_last-t_first); "
+            "median_interval_rate_hz=1/median(diff(t)) (diagnostic)",
             "validation_status": "OK",
             "warnings": [],
         }

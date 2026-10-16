@@ -288,7 +288,7 @@ class TestReaderBasic(unittest.TestCase):
         self.assertEqual(ch["nonpositive_diff_count"], 0)
         self.assertEqual(ch["validation_status"], "OK")
         # conditional rate present
-        self.assertTrue(isinstance(ch["conditional_sample_rate_hz"], float))
+        self.assertTrue(isinstance(ch["median_interval_rate_hz"], float))
 
     def test_inspect_missing_unit(self):
         y = [
@@ -345,3 +345,84 @@ class TestReaderBasic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(SCIPY_AVAILABLE, "scipy/numpy not available")
+class TestRateAudit(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+
+    def _path(self, name="t.mat"):
+        return os.path.join(self.td, name)
+
+    def test_uniform_timestamps_rates_agree(self):
+        t = [i * 0.001 for i in range(100)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"},
+             {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [
+            {"Name": "vibration_1", "Data": [1.0]*100, "XIndex": 1, "Unit": "m/s2"},
+            {"Name": "speed", "Data": [1.0]*100, "XIndex": 2, "Unit": "rpm"},
+        ]
+        p = make_mat(self._path(), x_entries=x, y_entries=y)
+        rep = inspect_mat(p)
+        for ch in ("vibration_1", "speed"):
+            c = rep["channels"][ch]
+            self.assertAlmostEqual(c["endpoint_rate_hz"], 1000.0, places=6)
+            self.assertAlmostEqual(c["median_interval_rate_hz"], 1000.0, places=6)
+            self.assertAlmostEqual(c["max_abs_residual_us"], 0.0, places=6)
+
+    def test_nonuniform_timestamps_may_differ(self):
+        t = [0.0, 0.001, 0.003, 0.006, 0.010]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"},
+             {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [
+            {"Name": "vibration_1", "Data": [1.0]*5, "XIndex": 1, "Unit": "m/s2"},
+            {"Name": "speed", "Data": [1.0]*5, "XIndex": 2, "Unit": "rpm"},
+        ]
+        p = make_mat(self._path(), x_entries=x, y_entries=y)
+        rep = inspect_mat(p)
+        c = rep["channels"]["vibration_1"]
+        fe = (5-1)/(t[-1]-t[0])
+        self.assertAlmostEqual(c["endpoint_rate_hz"], fe, places=6)
+        med = (t[2]-t[1])  # median of 4 diffs? use numpy
+        import numpy as np
+        med = float(np.median(np.diff(t)))
+        self.assertAlmostEqual(c["median_interval_rate_hz"], 1.0/med, places=6)
+        self.assertTrue(np.isfinite(c["max_abs_residual_s"]))
+
+    def test_residuals_do_not_modify_timestamps(self):
+        import numpy as np
+        from tools.paderborn_mat_reader.reader import timestamp_residuals, endpoint_rate
+        t = np.array([0.0, 0.001, 0.003, 0.006])
+        t_copy = t.copy()
+        res = timestamp_residuals(t)
+        self.assertEqual(res.shape, (4,))
+        np.testing.assert_array_equal(t, t_copy)
+        fe = endpoint_rate(t)
+        grid = t[0] + np.arange(4)/fe
+        np.testing.assert_allclose(res, t - grid)
+
+    def test_endpoint_rate_helper(self):
+        import numpy as np
+        from tools.paderborn_mat_reader.reader import endpoint_rate, median_interval_rate
+        t = np.array([0.0, 0.5, 1.0])
+        self.assertAlmostEqual(endpoint_rate(t), 2.0, places=6)
+        self.assertAlmostEqual(median_interval_rate(t), 2.0, places=6)
+        self.assertTrue(np.isnan(endpoint_rate(np.array([1.0]))))
+
+    def test_inspect_contains_both_rates(self):
+        t = [0.0, 0.1, 0.2]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"},
+             {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [
+            {"Name": "vibration_1", "Data": [1.0, 2.0, 3.0], "XIndex": 1, "Unit": "m/s2"},
+            {"Name": "speed", "Data": [1.0, 2.0, 3.0], "XIndex": 2, "Unit": "rpm"},
+        ]
+        p = make_mat(self._path(), x_entries=x, y_entries=y)
+        rep = inspect_mat(p)
+        for ch in ("vibration_1", "speed"):
+            c = rep["channels"][ch]
+            self.assertIn("endpoint_rate_hz", c)
+            self.assertIn("median_interval_rate_hz", c)
+            self.assertIn("max_abs_residual_s", c)
+            self.assertIn("max_abs_residual_us", c)

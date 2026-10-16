@@ -70,9 +70,16 @@ RPM; its unit is reported as stored.
 
 ## Sample rate
 
-The reported sample rate is `1 / median(timestamp diff)` and is
-**conditional** — valid only if timestamps are in seconds. This is a
-calculation, not a verified physical claim.
+Two conditional rates are reported (valid only if timestamps are in
+seconds):
+
+- `endpoint_rate_hz` = `(N - 1) / (t_last - t_first)` (approximate
+  endpoint-derived rate).
+- `median_interval_rate_hz` = `1 / median(diff(t))` (diagnostic rate).
+
+These may differ when timestamps are non-uniform. The maximum absolute
+residual against the endpoint-derived uniform grid is also reported.
+Neither value is a verified physical sampling rate.
 
 ## Common time support
 
