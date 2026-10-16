@@ -1,0 +1,95 @@
+{
+  "experiment_id": "EXP-C5C8-002",
+  "title": "Kinematic Order Invariance vs Structural Resonance Overfitting in Cross-Machine Transfer",
+  "random_seeds": [42, 1337, 2026, 7, 99],
+  "sampling_rate_harmonization": {
+    "target_fs_hz": 12000,
+    "resampling_method": "polyphase_anti_alias",
+    "filter_order": 64
+  },
+  "windowing": {
+    "window_length_samples": 2048,
+    "hop_length_samples": 1024,
+    "window_function": "hann"
+  },
+  "preprocessing": {
+    "detrend": "linear",
+    "bandpass_filter": {
+      "type": "butterworth",
+      "order": 4,
+      "lowcut_hz": 500,
+      "highcut_hz": 5000
+    },
+    "envelope_extraction": {
+      "method": "hilbert_magnitude",
+      "squared": false
+    },
+    "shaft_speed_estimation": {
+      "method": "idft_parabolic_interpolation",
+      "fft_length": 2048,
+      "search_tolerance_percent": 15.0
+    },
+    "angular_resampling": {
+      "samples_per_revolution": 64,
+      "max_orders": 16.0,
+      "interpolation_method": "linear"
+    },
+    "spectral_transform": {
+      "fft_length": 2048,
+      "output_bins": 1024,
+      "order_output_bins": 512,
+      "scaling": "magnitude"
+    }
+  },
+  "representations": {
+    "R1_Raw": {
+      "input_domain": "time_raw",
+      "input_dim": [1, 2048],
+      "model_type": "1D_CNN",
+      "backbone": "Compact1DCNN_3Layer"
+    },
+    "R1_Env": {
+      "input_domain": "time_envelope",
+      "input_dim": [1, 2048],
+      "model_type": "1D_CNN",
+      "backbone": "Compact1DCNN_3Layer"
+    },
+    "R2_Raw": {
+      "input_domain": "freq_raw_spectrum",
+      "input_dim": [1024],
+      "model_type": "MLP",
+      "backbone": "StandardMLP_2Layer"
+    },
+    "R2_Env": {
+      "input_domain": "freq_envelope_spectrum",
+      "input_dim": [1024],
+      "model_type": "MLP",
+      "backbone": "StandardMLP_2Layer"
+    },
+    "R3_Order": {
+      "input_domain": "order_envelope_spectrum",
+      "input_dim": [1024],
+      "zero_padded_from": 512,
+      "model_type": "MLP",
+      "backbone": "StandardMLP_2Layer"
+    }
+  },
+  "training": {
+    "optimizer": "AdamW",
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "batch_size": 32,
+    "max_epochs": 60,
+    "early_stopping_patience": 12,
+    "criterion": "CrossEntropyLoss",
+    "device": "cpu_deterministic",
+    "normalization": "source_train_zscore_only"
+  },
+  "statistical_evaluation": {
+    "primary_unit": "physical_bearing_uid",
+    "cluster_bootstrap_iterations": 10000,
+    "confidence_interval_level": 0.95,
+    "effect_size_metric": "hedges_g",
+    "regression_model": "linear_mixed_effects"
+  }
+}

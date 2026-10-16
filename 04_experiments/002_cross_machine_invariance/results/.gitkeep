@@ -1,0 +1,16 @@
+# results/ — experiment outputs [TBD]
+
+This directory will contain the per-seed transfer matrix and aggregated
+statistics. Planned layout (defined when `src/evaluate.py` lands):
+
+```
+results/
+├── per_seed/
+│   └── <source>_<target>_seed<seed>_<representation>.json
+├── transfer_matrix_<representation>.csv
+├── transfer_matrix_summary.csv        # mean ± 95 % CI, Hedges' g
+├── lme_regression.csv                 # linear mixed-effects coefficients
+└── critical_review.md                 # Reviewer agent output
+```
+
+No results are produced by this commit.
