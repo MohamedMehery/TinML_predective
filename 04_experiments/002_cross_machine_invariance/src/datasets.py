@@ -299,6 +299,8 @@ def load_real_paderborn_dataset(
             nominal_speed_hz=nominal_speed_hz,
             window_size=window_size,
             hop_size=hop_size,
+            resample_target_len=128,
+            strict_angular_support=True,
         )
         n_windows = int(reps["r1_raw"].shape[0])
 

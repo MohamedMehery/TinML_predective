@@ -107,6 +107,7 @@ def angular_resample(
     speed_hz: float,
     samples_per_rev: int = 64,
     target_len: int = 256,
+    strict_support: bool = False,
 ) -> np.ndarray:
     """Resample an envelope window to a *fixed-length* angular grid.
 
@@ -134,6 +135,21 @@ def angular_resample(
     t_angle = theta / (2.0 * np.pi * speed_hz)
     t_src = np.arange(N) / fs
 
+    # Strict support mode rejects any requested interpolation time that
+    # falls outside the observed samples. This prevents np.interp from
+    # silently substituting endpoint-clamped values for unobserved data.
+    if strict_support:
+        outside = (t_angle < t_src[0]) | (t_angle > t_src[-1])
+        if np.any(outside):
+            n_outside = int(np.count_nonzero(outside))
+            raise ValueError(
+                "angular resample request outside observed window support: "
+                f"{n_outside}/{t_angle.size} requested times outside "
+                f"[{float(t_src[0])}, {float(t_src[-1])}] s "
+                f"(speed_hz={float(speed_hz)}, target_len={int(target_len)}, "
+                f"samples_per_rev={int(samples_per_rev)})"
+            )
+
     # If t_angle extends slightly past the window, np.interp clamps to
     # the boundary value; that is acceptable (it is a single-sample
     # edge effect at the highest angle bin, well under 1 % of the
@@ -154,6 +170,7 @@ def extract_representations(
     r2_bins: int = 1024,
     r3_pre_pad_bins: int = 512,
     resample_target_len: int | None = None,
+    strict_angular_support: bool = False,
 ) -> dict:
     """Window + extract 5 representations from a single raw signal.
 
@@ -213,6 +230,7 @@ def extract_representations(
             w_env, fs, f_speed,
             samples_per_rev=samples_per_rev,
             target_len=resample_target_len,
+            strict_support=strict_angular_support,
         )
         spec = np.abs(fft.rfft(env_resampled * np.hanning(env_resampled.size), n=resample_target_len))
         # spec length is resample_target_len // 2 + 1; pad/trim to r2_bins.
