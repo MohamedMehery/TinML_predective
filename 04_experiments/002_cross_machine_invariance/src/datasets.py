@@ -25,7 +25,23 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .preprocess import RESAMPLE_TARGET_LEN, extract_representations
+try:
+    from .preprocess import RESAMPLE_TARGET_LEN, extract_representations, decimate_64k_to_12k
+except Exception:  # pragma: no cover - standalone import fallback
+    from preprocess import RESAMPLE_TARGET_LEN, extract_representations, decimate_64k_to_12k
+
+try:
+    from tools.paderborn_mat_reader.recording import (
+        load_pu_recording,
+        PuRecordingError,
+        CONDITION_CODE_MAP,
+    )
+except Exception:  # pragma: no cover - alternate import root
+    from paderborn_mat_reader.recording import (
+        load_pu_recording,
+        PuRecordingError,
+        CONDITION_CODE_MAP,
+    )
 
 
 # 3-class contract per the C5/C8 charter; Ball is excluded from the
@@ -223,3 +239,192 @@ def compute_source_train_zscore(X: np.ndarray, train_mask: np.ndarray) -> tuple[
 def apply_zscore(X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     """Apply a frozen (mean, std) to every row of X."""
     return ((X - mean) / std).astype(np.float32)
+
+
+@dataclass
+class RealPaderbornDataset(LoadedDataset):
+    condition_codes: np.ndarray
+    source_files: np.ndarray
+    window_indices: np.ndarray
+    nominal_speed_hz_per_window: np.ndarray
+    measured_speed_hz_mean: np.ndarray
+    measured_speed_hz_min: np.ndarray
+    measured_speed_hz_max: np.ndarray
+    nominal_revolutions_per_window: np.ndarray
+    measured_revolutions_per_window: np.ndarray
+    window_duration_s: np.ndarray
+    window_span_s: np.ndarray
+    window_metadata: list
+
+
+def load_real_paderborn_dataset(
+    mat_paths,
+    *,
+    window_size: int = 2048,
+    hop_size: int = 1024,
+    fs_out: int = 12000,
+):
+    """Load real Paderborn recordings into the experiment dataset format.
+
+    Uses ``load_pu_recording`` with ``speed_unit="rpm_assumed"`` and default
+    validation thresholds, resamples vibration to 12 kHz via
+    ``decimate_64k_to_12k``, and applies the existing window/hop convention.
+    Nominal (filename-derived) speed is passed to ``extract_representations``.
+    """
+    if isinstance(mat_paths, (str, os.PathLike)):
+        paths = [str(mat_paths)]
+    else:
+        paths = [str(p) for p in mat_paths]
+
+    parts = []
+    all_window_meta = []
+    global_window_index = 0
+
+    for mat_path in paths:
+        rec = load_pu_recording(mat_path, speed_unit="rpm_assumed")
+        condition_code = rec.metadata["condition_code"]
+        if condition_code not in CONDITION_CODE_MAP:
+            raise PuRecordingError(
+                f"unsupported condition code {condition_code!r} for {mat_path!r}"
+            )
+        nominal_rpm = int(rec.metadata["nominal_rpm"])
+        nominal_speed_hz = float(nominal_rpm) / 60.0
+
+        vib_12k = decimate_64k_to_12k(rec.vibration)
+        vib_12k = np.asarray(vib_12k).reshape(-1)
+
+        reps = extract_representations(
+            vib_12k,
+            fs=fs_out,
+            nominal_speed_hz=nominal_speed_hz,
+            window_size=window_size,
+            hop_size=hop_size,
+        )
+        n_windows = int(reps["r1_raw"].shape[0])
+
+        labels = np.full(n_windows, -1, dtype=np.int64)
+        uid = os.path.splitext(os.path.basename(mat_path))[0]
+        uids = np.full(n_windows, uid, dtype=object)
+        dataset = np.full(n_windows, "PU", dtype=object)
+
+        orig_ts = np.asarray(rec.vibration_time, dtype=np.float64).ravel()
+        orig_speed = np.asarray(rec.speed_hz, dtype=np.float64).ravel()
+        rec_start = float(orig_ts[0]) if orig_ts.size else 0.0
+
+        cond_arr = np.full(n_windows, condition_code, dtype=object)
+        source_arr = np.full(n_windows, os.path.basename(mat_path), dtype=object)
+        window_indices = np.arange(n_windows, dtype=np.int64)
+        nominal_arr = np.full(n_windows, nominal_speed_hz, dtype=np.float32)
+        meas_mean = np.empty(n_windows, dtype=np.float32)
+        meas_min = np.empty(n_windows, dtype=np.float32)
+        meas_max = np.empty(n_windows, dtype=np.float32)
+        nom_revs = np.empty(n_windows, dtype=np.float32)
+        meas_revs = np.empty(n_windows, dtype=np.float32)
+        dur_arr = np.full(n_windows, window_size / float(fs_out), dtype=np.float32)
+        span_arr = np.full(n_windows, (window_size - 1) / float(fs_out), dtype=np.float32)
+
+        for w in range(n_windows):
+            start_idx = w * hop_size
+            t_first = rec_start + start_idx / float(fs_out)
+            t_last = t_first + (window_size - 1) / float(fs_out)
+            mask = (orig_ts >= t_first) & (orig_ts <= t_last)
+            selected = orig_speed[mask]
+            if selected.size == 0:
+                raise PuRecordingError(
+                    f"no valid speed samples in time interval [{t_first}, {t_last}] "
+                    f"for window {w} of {mat_path!r}"
+                )
+            m_mean = float(np.mean(selected))
+            m_min = float(np.min(selected))
+            m_max = float(np.max(selected))
+            meas_mean[w] = m_mean
+            meas_min[w] = m_min
+            meas_max[w] = m_max
+            nom_revs[w] = nominal_speed_hz * (window_size / float(fs_out))
+            meas_revs[w] = m_mean * (window_size / float(fs_out))
+
+            all_window_meta.append({
+                "uid": uid,
+                "condition_code": condition_code,
+                "source_file": os.path.basename(mat_path),
+                "window_index": int(w),
+                "nominal_speed_hz": nominal_speed_hz,
+                "measured_speed_hz_mean": m_mean,
+                "measured_speed_hz_min": m_min,
+                "measured_speed_hz_max": m_max,
+                "nominal_revolutions_per_window": float(nom_revs[w]),
+                "measured_revolutions_per_window": float(meas_revs[w]),
+                "window_duration_s": float(window_size / float(fs_out)),
+                "window_span_s": float((window_size - 1) / float(fs_out)),
+                "time_interval_start_s": float(t_first),
+                "time_interval_end_s": float(t_last),
+            })
+
+        reps["labels"] = labels
+        reps["uids"] = uids
+        reps["dataset"] = dataset
+
+        ds = RealPaderbornDataset(
+            name="PU",
+            r1_raw=reps["r1_raw"],
+            r1_env=reps["r1_env"],
+            r2_raw=reps["r2_raw"],
+            r2_env=reps["r2_env"],
+            r3_order=reps["r3_order"],
+            labels=reps["labels"],
+            uids=reps["uids"],
+            speed_estimates=reps["speed_estimates"],
+            true_speeds=reps["true_speeds"],
+            fs_hz=fs_out,
+            condition_codes=cond_arr,
+            source_files=source_arr,
+            window_indices=window_indices,
+            nominal_speed_hz_per_window=nominal_arr,
+            measured_speed_hz_mean=meas_mean,
+            measured_speed_hz_min=meas_min,
+            measured_speed_hz_max=meas_max,
+            nominal_revolutions_per_window=nom_revs,
+            measured_revolutions_per_window=meas_revs,
+            window_duration_s=dur_arr,
+            window_span_s=span_arr,
+            window_metadata=all_window_meta[-n_windows:],
+        )
+        parts.append(ds)
+
+    if not parts:
+        raise ValueError("no Paderborn inputs provided")
+
+    if len(parts) == 1:
+        return parts[0]
+
+    # Concatenate multiple inputs.
+    concat_meta = []
+    for p in parts:
+        concat_meta.extend(p.window_metadata)
+
+    out_ds = RealPaderbornDataset(
+        name="PU",
+        r1_raw=np.concatenate([p.r1_raw for p in parts], axis=0),
+        r1_env=np.concatenate([p.r1_env for p in parts], axis=0),
+        r2_raw=np.concatenate([p.r2_raw for p in parts], axis=0),
+        r2_env=np.concatenate([p.r2_env for p in parts], axis=0),
+        r3_order=np.concatenate([p.r3_order for p in parts], axis=0),
+        labels=np.concatenate([p.labels for p in parts]),
+        uids=np.concatenate([p.uids for p in parts]),
+        speed_estimates=np.concatenate([p.speed_estimates for p in parts]),
+        true_speeds=np.concatenate([p.true_speeds for p in parts]),
+        fs_hz=fs_out,
+        condition_codes=np.concatenate([p.condition_codes for p in parts]),
+        source_files=np.concatenate([p.source_files for p in parts]),
+        window_indices=np.concatenate([p.window_indices for p in parts]),
+        nominal_speed_hz_per_window=np.concatenate([p.nominal_speed_hz_per_window for p in parts]),
+        measured_speed_hz_mean=np.concatenate([p.measured_speed_hz_mean for p in parts]),
+        measured_speed_hz_min=np.concatenate([p.measured_speed_hz_min for p in parts]),
+        measured_speed_hz_max=np.concatenate([p.measured_speed_hz_max for p in parts]),
+        nominal_revolutions_per_window=np.concatenate([p.nominal_revolutions_per_window for p in parts]),
+        measured_revolutions_per_window=np.concatenate([p.measured_revolutions_per_window for p in parts]),
+        window_duration_s=np.concatenate([p.window_duration_s for p in parts]),
+        window_span_s=np.concatenate([p.window_span_s for p in parts]),
+        window_metadata=concat_meta,
+    )
+    return out_ds

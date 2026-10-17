@@ -121,3 +121,16 @@ Owner decisions (recorded here, not in the research charter or protocol):
   audited KA01 files, but RPM is an inference, not a unit documented in MAT
   metadata. Raw speed statistics are reported as stored values with undocumented
   physical units.
+
+## Stage 1 resampling decision (64 -> 12 kHz)
+
+Stage 1 processes Paderborn vibration at a nominal 12 kHz using rational
+polyphase resampling with up=3, down=16 from the assumed nominal 64 kHz
+input timebase. The verified Kaiser filter from
+`04_experiments/002_cross_machine_invariance/src/preprocess_decim.py`
+is reused (1395 taps, 5500 Hz cutoff at the polyphase rate). The input
+vibration samples are treated as nominally uniformly sampled at 64 kHz for
+this Stage 1 path; this is an engineering assumption supported by the two
+audited KA01 files, not proof that every Paderborn recording has identical
+timing behavior. The explicit `speed_unit="rpm_assumed"` loader argument
+remains mandatory; RPM is not documented in the source MAT metadata.

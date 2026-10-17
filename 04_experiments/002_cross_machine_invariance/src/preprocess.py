@@ -28,6 +28,11 @@ import numpy as np
 import scipy.fft as fft
 import scipy.signal as signal
 
+try:
+    from .preprocess_decim import decimate_64k_to_12k as _verified_decimate_64k_to_12k
+except Exception:  # pragma: no cover - standalone import fallback
+    from preprocess_decim import decimate_64k_to_12k as _verified_decimate_64k_to_12k
+
 
 # --- Per-dataset resample target lengths (fixed, never mixed) -----------
 # CWRU at 12 kHz: 4 revolutions x 64 samples/rev = 256 output samples.
@@ -223,3 +228,17 @@ def extract_representations(
         out["r3_order"][w, r3_pre_pad_bins:] = 0.0
 
     return out
+
+
+def decimate_64k_to_12k(x):
+    """Public wrapper for the verified 64 kHz -> 12 kHz resampler.
+
+    Delegates to ``preprocess_decim.decimate_64k_to_12k`` without
+    duplicating or redesigning the Kaiser FIR. Input may be 1-D
+    ``(n_samples,)`` or 2-D ``(n_channels, n_samples)``. Output length
+    follows the existing routine's convention: ``ceil(n * 3 / 16)``
+    samples at 12 kHz. Edge handling is performed by ``scipy.signal.
+    resample_poly`` with the verified 1395-tap Kaiser window.
+    """
+    arr = np.asarray(x)
+    return _verified_decimate_64k_to_12k(arr)

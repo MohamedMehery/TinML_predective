@@ -1,11 +1,19 @@
 {
   "experiment_id": "EXP-C5C8-002",
   "title": "Kinematic Order Invariance vs Structural Resonance Overfitting in Cross-Machine Transfer",
-  "random_seeds": [42, 1337, 2026, 7, 99],
+  "random_seeds": [
+    42,
+    1337,
+    2026,
+    7,
+    99
+  ],
   "sampling_rate_harmonization": {
     "target_fs_hz": 12000,
     "resampling_method": "polyphase_anti_alias",
-    "filter_order": 64
+    "numtaps": 1395,
+    "cutoff_hz_polyphase": 5500,
+    "design": "kaiser_60dB"
   },
   "windowing": {
     "window_length_samples": 2048,
@@ -44,31 +52,43 @@
   "representations": {
     "R1_Raw": {
       "input_domain": "time_raw",
-      "input_dim": [1, 2048],
+      "input_dim": [
+        1,
+        2048
+      ],
       "model_type": "1D_CNN",
       "backbone": "Compact1DCNN_3Layer"
     },
     "R1_Env": {
       "input_domain": "time_envelope",
-      "input_dim": [1, 2048],
+      "input_dim": [
+        1,
+        2048
+      ],
       "model_type": "1D_CNN",
       "backbone": "Compact1DCNN_3Layer"
     },
     "R2_Raw": {
       "input_domain": "freq_raw_spectrum",
-      "input_dim": [1024],
+      "input_dim": [
+        1024
+      ],
       "model_type": "MLP",
       "backbone": "StandardMLP_2Layer"
     },
     "R2_Env": {
       "input_domain": "freq_envelope_spectrum",
-      "input_dim": [1024],
+      "input_dim": [
+        1024
+      ],
       "model_type": "MLP",
       "backbone": "StandardMLP_2Layer"
     },
     "R3_Order": {
       "input_domain": "order_envelope_spectrum",
-      "input_dim": [1024],
+      "input_dim": [
+        1024
+      ],
       "zero_padded_from": 512,
       "model_type": "MLP",
       "backbone": "StandardMLP_2Layer"

@@ -25,7 +25,7 @@ CONDITION_CODE_MAP = {
 FS_NOMINAL_HZ = 64000
 
 
-class PuRecordingError(MatReaderError):
+class PuRecordingError(MatReaderError, ValueError):
     """Raised when a Paderborn recording cannot be loaded/validated."""
 
 
