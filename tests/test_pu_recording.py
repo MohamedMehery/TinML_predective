@@ -142,3 +142,99 @@ class TestPuRecording(unittest.TestCase):
         p = self._make("N15_M07_F10_KA01_1.mat", x_entries=x, y_entries=y)
         with self.assertRaises(PuRecordingError):
             load_pu_recording(p, speed_unit="rpm_assumed")
+
+    def test_custom_nominal_sampling_rate(self):
+        t = [i/32000.0 for i in range(10)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [{"Name": "vibration_1", "Data": [1.0]*10, "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [1500.0]*10, "XIndex": 2, "Unit": "rpm"}]
+        p = self._make("N15_M07_F10_KA01_1.mat", x_entries=x, y_entries=y)
+        rec = load_pu_recording(p, speed_unit="rpm_assumed", fs_nominal_hz=32000)
+        self.assertEqual(rec.fs_nominal_hz, 32000)
+        self.assertAlmostEqual(rec.fs_endpoint_hz, 32000.0, places=3)
+
+    def test_custom_endpoint_rate_tolerance(self):
+        t = [i/63000.0 for i in range(100)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [{"Name": "vibration_1", "Data": [1.0]*100, "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [1500.0]*100, "XIndex": 2, "Unit": "rpm"}]
+        p = self._make("N15_M07_F10_KA01_1.mat", x_entries=x, y_entries=y)
+        with self.assertRaises(PuRecordingError):
+            load_pu_recording(p, speed_unit="rpm_assumed", fs_nominal_hz=64000, endpoint_rate_rel_tol=0.001)
+        rec = load_pu_recording(p, speed_unit="rpm_assumed", fs_nominal_hz=64000, endpoint_rate_rel_tol=0.02)
+        self.assertAlmostEqual(rec.fs_endpoint_hz, 63000.0, places=3)
+
+    def test_custom_residual_limit(self):
+        import math
+        t = [i/64000.0 + 5e-5*math.sin(math.pi*i/199) for i in range(200)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [{"Name": "vibration_1", "Data": [1.0]*200, "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [1500.0]*200, "XIndex": 2, "Unit": "rpm"}]
+        p = self._make("N15_M07_F10_KA01_1.mat", x_entries=x, y_entries=y)
+        with self.assertRaises(PuRecordingError):
+            load_pu_recording(p, speed_unit="rpm_assumed")
+        rec = load_pu_recording(p, speed_unit="rpm_assumed", max_abs_residual_s=1e-4)
+        self.assertEqual(rec.metadata["retained_count"], 200)
+
+    def test_custom_speed_tolerance(self):
+        t = [i/64000.0 for i in range(10)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [{"Name": "vibration_1", "Data": [1.0]*10, "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [1400.0]*10, "XIndex": 2, "Unit": "rpm"}]
+        p = self._make("N15_M07_F10_KA01_1.mat", x_entries=x, y_entries=y)
+        with self.assertRaises(PuRecordingError):
+            load_pu_recording(p, speed_unit="rpm_assumed")
+        rec = load_pu_recording(p, speed_unit="rpm_assumed", speed_rel_tol=0.1)
+        self.assertEqual(rec.metadata["retained_count"], 10)
+
+    def test_invalid_parameter_values(self):
+        p = self._make("N15_M07_F10_KA01_1.mat")
+        for kw in [{"fs_nominal_hz": 0}, {"fs_nominal_hz": -1}, {"fs_nominal_hz": 1.5},
+                   {"endpoint_rate_rel_tol": 0}, {"endpoint_rate_rel_tol": 1}, {"endpoint_rate_rel_tol": 1.5},
+                   {"max_abs_residual_s": 0}, {"max_abs_residual_s": -1},
+                   {"speed_rel_tol": 0}, {"speed_rel_tol": 1}, {"speed_rel_tol": 1.5}]:
+            with self.assertRaises(PuRecordingError):
+                load_pu_recording(p, speed_unit="rpm_assumed", **kw)
+
+    def test_all_supported_condition_codes(self):
+        cases = [("N15_M07_F10", 1500, 0.7, 1000), ("N09_M07_F10", 900, 0.7, 1000),
+                 ("N15_M01_F10", 1500, 0.1, 1000), ("N15_M07_F04", 1500, 0.7, 400)]
+        for code, rpm, torque, force in cases:
+            t = [i/64000.0 for i in range(5)]
+            x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+            y = [{"Name": "vibration_1", "Data": [1.0]*5, "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [float(rpm)]*5, "XIndex": 2, "Unit": "rpm"}]
+            p = self._make(f"{code}_KA01_1.mat", x_entries=x, y_entries=y)
+            rec = load_pu_recording(p, speed_unit="rpm_assumed")
+            self.assertEqual(rec.metadata["condition_code"], code)
+            self.assertEqual(rec.metadata["nominal_rpm"], rpm)
+            self.assertEqual(rec.metadata["torque_nm"], torque)
+            self.assertEqual(rec.metadata["radial_force_n"], force)
+
+    def test_reject_unknown_incomplete_condition_codes(self):
+        t = [i/64000.0 for i in range(5)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [{"Name": "vibration_1", "Data": [1.0]*5, "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [1500.0]*5, "XIndex": 2, "Unit": "rpm"}]
+        for name in ["N99_M07_F10_KA01_1.mat", "N15_M07_KA01_1.mat", "N15_M07_F99_KA01_1.mat"]:
+            p = self._make(name, x_entries=x, y_entries=y)
+            with self.assertRaises(PuRecordingError):
+                load_pu_recording(p, speed_unit="rpm_assumed")
+
+    def test_raw_speed_statistics_from_original_values(self):
+        t = [i/64000.0 for i in range(3)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [{"Name": "vibration_1", "Data": [1.0, 2.0, 3.0], "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [1490.0, 1500.0, 1510.0], "XIndex": 2, "Unit": "rpm"}]
+        p = self._make("N15_M07_F10_KA01_1.mat", x_entries=x, y_entries=y)
+        rec = load_pu_recording(p, speed_unit="rpm_assumed")
+        self.assertEqual(rec.metadata["raw_speed_min"], 1490.0)
+        self.assertEqual(rec.metadata["raw_speed_mean"], 1500.0)
+        self.assertEqual(rec.metadata["raw_speed_max"], 1510.0)
+        self.assertEqual(rec.metadata["speed_raw_min"], 1490.0)
+        self.assertEqual(rec.metadata["speed_raw_mean"], 1500.0)
+        self.assertEqual(rec.metadata["speed_raw_max"], 1510.0)
+        self.assertEqual(rec.metadata["raw_speed_statistics"]["min"], 1490.0)
+
+    def test_default_behavior_preserved(self):
+        t = [i/64000.0 for i in range(5)]
+        x = [{"Name": "TimeVib", "Data": t, "Unit": "s"}, {"Name": "TimeSpeed", "Data": t, "Unit": "s"}]
+        y = [{"Name": "vibration_1", "Data": [1.0]*5, "XIndex": 1, "Unit": "m/s2"}, {"Name": "speed", "Data": [1500.0]*5, "XIndex": 2, "Unit": "rpm"}]
+        p = self._make("N15_M07_F10_KA01_1.mat", x_entries=x, y_entries=y)
+        rec = load_pu_recording(p, speed_unit="rpm_assumed")
+        self.assertEqual(rec.fs_nominal_hz, 64000)
+        self.assertEqual(rec.metadata["fs_nominal_hz"], 64000)
+        self.assertEqual(rec.metadata["max_abs_residual_limit_s"], 1.0/64000.0)

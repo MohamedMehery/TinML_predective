@@ -95,3 +95,29 @@ only. They do **not** prove compatibility with actual KA01 files.
 Actual KA01 compatibility remains unverified until a separate local
 smoke test opens the real recordings (not possible in this environment
 due to network restrictions).
+
+## Protocol-neutral recording loader
+
+`recording.py` provides `load_pu_recording(path, *, speed_unit, fs_nominal_hz=64000,
+endpoint_rate_rel_tol=0.001, max_abs_residual_s=1/64000, speed_rel_tol=0.05)`.
+
+`speed_unit="rpm_assumed"` is required. The loader reuses `read_mat`/`inspect_mat`,
+validates original timestamp axes, applies common time-support truncation, and
+linearly interpolates stored speed values at retained vibration timestamps.
+
+Supported complete condition codes: `N15_M07_F10`, `N09_M07_F10`,
+`N15_M01_F10`, `N15_M07_F04`.
+
+Owner decisions (recorded here, not in the research charter or protocol):
+
+- Vibration timebase: Stage 1 treats vibration samples as nominally uniform at
+  64 kHz. The two audited KA01 recordings had maximum absolute timestamp
+  residuals no greater than approximately 8.04 us (about half a nominal 64 kHz
+  sample period). This supports the stated engineering assumption for those two
+  recordings only; it does not prove that every Paderborn recording has the same
+  timing behavior. Original timestamps remain available through `read_mat`.
+- Speed unit: `speed_unit="rpm_assumed"` remains mandatory. Raw values are
+  numerically consistent with the documented 1500/900 RPM conditions in the two
+  audited KA01 files, but RPM is an inference, not a unit documented in MAT
+  metadata. Raw speed statistics are reported as stored values with undocumented
+  physical units.

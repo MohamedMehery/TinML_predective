@@ -15,9 +15,11 @@ import numpy as np
 
 from .reader import MatReaderError, read_mat, inspect_mat
 
-NOMINAL_RPM_MAP = {
-    "N15": 1500,
-    "N09": 900,
+CONDITION_CODE_MAP = {
+    "N15_M07_F10": {"nominal_rpm": 1500, "torque_nm": 0.7, "radial_force_n": 1000},
+    "N09_M07_F10": {"nominal_rpm": 900, "torque_nm": 0.7, "radial_force_n": 1000},
+    "N15_M01_F10": {"nominal_rpm": 1500, "torque_nm": 0.1, "radial_force_n": 1000},
+    "N15_M07_F04": {"nominal_rpm": 1500, "torque_nm": 0.7, "radial_force_n": 400},
 }
 
 FS_NOMINAL_HZ = 64000
@@ -46,21 +48,29 @@ def _parse_filename(path: str):
     parts = stem.split("_")
     if len(parts) < 4:
         raise PuRecordingError(
-            f"filename {base!r} does not contain condition code and bearing id"
+            f"filename {base!r} does not contain a complete condition code and bearing id"
         )
     condition_code = "_".join(parts[:3])
     bearing_id = parts[3]
-    speed_token = parts[0]
-    if speed_token not in NOMINAL_RPM_MAP:
+    if condition_code not in CONDITION_CODE_MAP:
         raise PuRecordingError(
-            f"unsupported condition code prefix {speed_token!r} in {base!r}; "
-            f"supported: {sorted(NOMINAL_RPM_MAP)}"
+            f"unsupported or incomplete condition code {condition_code!r} in {base!r}; "
+            f"supported: {sorted(CONDITION_CODE_MAP)}"
         )
-    nominal_rpm = NOMINAL_RPM_MAP[speed_token]
-    return bearing_id, condition_code, nominal_rpm
+    info = CONDITION_CODE_MAP[condition_code]
+    nominal_rpm = int(info["nominal_rpm"])
+    return bearing_id, condition_code, nominal_rpm, float(info["torque_nm"]), float(info["radial_force_n"])
 
 
-def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
+def load_pu_recording(
+    path: str,
+    *,
+    speed_unit: str,
+    fs_nominal_hz: int = FS_NOMINAL_HZ,
+    endpoint_rate_rel_tol: float = 0.001,
+    max_abs_residual_s: float = 1.0 / 64000.0,
+    speed_rel_tol: float = 0.05,
+) -> PuRecording:
     """Load and validate a Paderborn MAT recording.
 
     ``speed_unit`` must be explicitly ``"rpm_assumed"``.
@@ -70,7 +80,31 @@ def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
             f"unsupported speed_unit {speed_unit!r}; only 'rpm_assumed' is supported"
         )
 
-    bearing_id, condition_code, nominal_rpm = _parse_filename(path)
+    # Validate tunable thresholds/parameters.
+    try:
+        fs_nominal_hz_int = int(fs_nominal_hz)
+    except (TypeError, ValueError) as exc:
+        raise PuRecordingError(f"invalid fs_nominal_hz {fs_nominal_hz!r}") from exc
+    if fs_nominal_hz_int <= 0 or float(fs_nominal_hz) != fs_nominal_hz_int:
+        raise PuRecordingError(f"invalid fs_nominal_hz {fs_nominal_hz!r}; must be a positive integer")
+    fs_nominal_hz = fs_nominal_hz_int
+    if not isinstance(endpoint_rate_rel_tol, (int, float)) or not (0.0 < float(endpoint_rate_rel_tol) < 1.0):
+        raise PuRecordingError(
+            f"invalid endpoint_rate_rel_tol {endpoint_rate_rel_tol!r}; must be in (0, 1)"
+        )
+    endpoint_rate_rel_tol = float(endpoint_rate_rel_tol)
+    if not isinstance(max_abs_residual_s, (int, float)) or float(max_abs_residual_s) <= 0.0:
+        raise PuRecordingError(
+            f"invalid max_abs_residual_s {max_abs_residual_s!r}; must be > 0"
+        )
+    max_abs_residual_s = float(max_abs_residual_s)
+    if not isinstance(speed_rel_tol, (int, float)) or not (0.0 < float(speed_rel_tol) < 1.0):
+        raise PuRecordingError(
+            f"invalid speed_rel_tol {speed_rel_tol!r}; must be in (0, 1)"
+        )
+    speed_rel_tol = float(speed_rel_tol)
+
+    bearing_id, condition_code, nominal_rpm, torque_nm, radial_force_n = _parse_filename(path)
 
     data = read_mat(path)
     channels = data["channels"]
@@ -86,6 +120,11 @@ def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
     vibration_time = np.asarray(vib.timestamps, dtype=np.float64).ravel().copy()
     speed_values = np.asarray(spd.values, dtype=np.float64).ravel()
     speed_time = np.asarray(spd.timestamps, dtype=np.float64).ravel().copy()
+
+    # Raw stored speed statistics (before RPM/Hz conversion or interpolation).
+    raw_speed_min = float(np.min(speed_values)) if speed_values.size else float("nan")
+    raw_speed_mean = float(np.mean(speed_values)) if speed_values.size else float("nan")
+    raw_speed_max = float(np.max(speed_values)) if speed_values.size else float("nan")
 
     # Validation gate 3: timestamp validity (before truncation)
     if vibration.shape != vibration_time.shape:
@@ -115,17 +154,17 @@ def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
     rep = inspect_mat(path)
     vrep = rep["channels"]["vibration_1"]
     fs_endpoint_hz = float(vrep["endpoint_rate_hz"])
-    max_abs_residual_s = float(vrep["max_abs_residual_s"])
+    measured_max_abs_residual_s = float(vrep["max_abs_residual_s"])
 
-    if abs(fs_endpoint_hz - FS_NOMINAL_HZ) / FS_NOMINAL_HZ >= 0.001:
+    if abs(fs_endpoint_hz - fs_nominal_hz) / fs_nominal_hz >= endpoint_rate_rel_tol:
         raise PuRecordingError(
             f"endpoint rate gate failed: {fs_endpoint_hz} Hz vs nominal "
-            f"{FS_NOMINAL_HZ} Hz"
+            f"{fs_nominal_hz} Hz"
         )
-    if not (max_abs_residual_s < 1.0 / FS_NOMINAL_HZ):
+    if not (measured_max_abs_residual_s < max_abs_residual_s):
         raise PuRecordingError(
-            f"timestamp residual gate failed: {max_abs_residual_s} s >= "
-            f"{1.0 / FS_NOMINAL_HZ} s"
+            f"timestamp residual gate failed: {measured_max_abs_residual_s} s >= "
+            f"{max_abs_residual_s} s"
         )
 
     # Common time support
@@ -158,7 +197,7 @@ def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
     mean_speed_rpm = float(np.mean(speed_in_support))
     nominal_hz = nominal_rpm / 60.0
     mean_speed_hz = mean_speed_rpm / 60.0
-    if nominal_hz <= 0 or abs(mean_speed_hz - nominal_hz) / nominal_hz > 0.05:
+    if nominal_hz <= 0 or abs(mean_speed_hz - nominal_hz) / nominal_hz > speed_rel_tol:
         raise PuRecordingError(
             f"speed consistency gate failed: mean {mean_speed_hz} Hz vs "
             f"nominal {nominal_hz} Hz"
@@ -173,9 +212,11 @@ def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
         "condition_code": condition_code,
         "nominal_rpm": nominal_rpm,
         "nominal_hz": nominal_hz,
-        "fs_nominal_hz": FS_NOMINAL_HZ,
+        "torque_nm": torque_nm,
+        "radial_force_n": radial_force_n,
+        "fs_nominal_hz": fs_nominal_hz,
         "fs_endpoint_hz": fs_endpoint_hz,
-        "max_abs_residual_s": max_abs_residual_s,
+        "max_abs_residual_s": measured_max_abs_residual_s,
         "dropped_begin": dropped_begin,
         "dropped_end": dropped_end,
         "dropped_total": int(dropped_begin + dropped_end),
@@ -184,11 +225,28 @@ def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
         "speed_unit_assumption": "rpm_assumed",
         "mean_speed_rpm_in_support": mean_speed_rpm,
         "mean_speed_hz_in_support": mean_speed_hz,
+        "speed_rel_tol": speed_rel_tol,
+        "endpoint_rate_rel_tol": endpoint_rate_rel_tol,
+        "max_abs_residual_limit_s": max_abs_residual_s,
         "t_start": t_start,
         "t_end": t_end,
+        "raw_speed_min": raw_speed_min,
+        "raw_speed_mean": raw_speed_mean,
+        "raw_speed_max": raw_speed_max,
+        "speed_raw_min": raw_speed_min,
+        "speed_raw_mean": raw_speed_mean,
+        "speed_raw_max": raw_speed_max,
+        "raw_speed_statistics": {
+            "min": raw_speed_min,
+            "mean": raw_speed_mean,
+            "max": raw_speed_max,
+        },
+        "raw_speed_unit": "as stored (undocumented physical units)",
         "assumptions": [
             "speed values are assumed to be in RPM and converted to Hz by /60",
-            "fs_nominal_hz=64000 is a nominal engineering assumption",
+            "raw speed statistics are calculated from original stored values before conversion/interpolation",
+            "raw speed physical units are undocumented in MAT metadata",
+            "fs_nominal_hz is a nominal engineering assumption",
             "common time support from original timestamps",
             "speed linearly interpolated at retained vibration timestamps",
             "no extrapolation; queries verified within speed timestamp range",
@@ -199,7 +257,7 @@ def load_pu_recording(path: str, *, speed_unit: str) -> PuRecording:
         vibration=retained_vibration.astype(np.float64),
         vibration_time=retained_time.astype(np.float64),
         speed_hz=speed_hz,
-        fs_nominal_hz=FS_NOMINAL_HZ,
+        fs_nominal_hz=fs_nominal_hz,
         fs_endpoint_hz=fs_endpoint_hz,
         metadata=metadata,
     )
