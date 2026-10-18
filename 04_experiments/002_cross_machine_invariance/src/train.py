@@ -56,22 +56,82 @@ def train_one_fold(
     max_epochs: int = 60,
     early_stopping_patience: int = 12,
     val_frac: float = 0.15,
+    use_supplied_validation: bool = False,
 ) -> nn.Module:
-    """Train one model on the source-train fold with internal val split.
+    """Train one model on a source-train fold with optional supplied validation.
 
-    Returns the best-validation model state (re-loaded into a fresh
-    model object so the caller can `state_dict()` it for serialization).
+    With ``use_supplied_validation=False`` (the default), the existing
+    internal window-level random split of ``X_train/y_train`` is preserved.
+    That split is unsuitable for bearing-level generalization claims because
+    windows from one physical bearing may occur in both the fit and validation
+    subsets.
+
+    For Stage 1 bearing-level work, callers must explicitly set
+    ``use_supplied_validation=True`` and pass verified, bearing-disjoint,
+    source-domain training and validation arrays. This function does not
+    establish or verify bearing-disjointness; constructing and checking that
+    split is the caller's responsibility. In a zero-shot transfer evaluation,
+    target-domain final-evaluation data must never be supplied for early
+    stopping.
+
+    When enabled, the supplied ``X_val/y_val`` arrays are required to be
+    non-empty and have matching sample counts. The function returns the
+    best-validation model state (re-loaded into a fresh model object so the
+    caller can ``state_dict()`` it for serialization).
     """
+    if use_supplied_validation:
+        if X_val is None:
+            raise ValueError(
+                "use_supplied_validation=True requires a non-None X_val array"
+            )
+        if y_val is None:
+            raise ValueError(
+                "use_supplied_validation=True requires a non-None y_val array"
+            )
+        try:
+            n_x_val = len(X_val)
+        except TypeError as exc:
+            raise ValueError(
+                "use_supplied_validation=True requires X_val to be a non-empty "
+                "sample array"
+            ) from exc
+        try:
+            n_y_val = len(y_val)
+        except TypeError as exc:
+            raise ValueError(
+                "use_supplied_validation=True requires y_val to be a non-empty "
+                "sample array"
+            ) from exc
+        if n_x_val == 0:
+            raise ValueError(
+                "use_supplied_validation=True requires X_val to contain at least "
+                "one validation sample"
+            )
+        if n_y_val == 0:
+            raise ValueError(
+                "use_supplied_validation=True requires y_val to contain at least "
+                "one validation label"
+            )
+        if n_x_val != n_y_val:
+            raise ValueError(
+                "use_supplied_validation=True requires matching X_val/y_val "
+                f"sample counts; got {n_x_val} and {n_y_val}"
+            )
+
     _set_seed(seed)
 
-    # Carve out a validation slice from the source-train fold.
-    n = X_train.shape[0]
-    perm = np.random.RandomState(seed).permutation(n)
-    n_val = max(1, int(round(val_frac * n)))
-    val_idx = perm[:n_val]
-    tr_idx = perm[n_val:]
-    Xtr, ytr = X_train[tr_idx], y_train[tr_idx]
-    Xv, yv = X_train[val_idx], y_train[val_idx]
+    if use_supplied_validation:
+        Xtr, ytr = X_train, y_train
+        Xv, yv = X_val, y_val
+    else:
+        # Carve out a validation slice from the source-train fold.
+        n = X_train.shape[0]
+        perm = np.random.RandomState(seed).permutation(n)
+        n_val = max(1, int(round(val_frac * n)))
+        val_idx = perm[:n_val]
+        tr_idx = perm[n_val:]
+        Xtr, ytr = X_train[tr_idx], y_train[tr_idx]
+        Xv, yv = X_train[val_idx], y_train[val_idx]
 
     model = build_model(representation, num_classes=num_classes)
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
