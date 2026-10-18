@@ -19,9 +19,11 @@ lives in `models.py`.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -52,12 +54,161 @@ INV_CLASS_MAP_3 = {v: k for k, v in CLASS_MAP_3.items()}
 # Acceptable input dataset names (matches the pilot manifest schema).
 DATASET_NAMES = {"CWRU", "PU", "SEU"}
 
+_PADERBORN_CLASS_MAP_FIELDS = (
+    "bearing_id",
+    "class_name",
+    "label",
+    "damage_origin",
+    "source_table",
+    "source_component",
+    "source_combination",
+    "extent_level",
+    "stage1_status",
+)
+_PADERBORN_INCLUDED_CLASSES = {
+    ("Healthy", 0),
+    ("Outer_Race", 1),
+    ("Inner_Race", 2),
+}
+
+
+def _paderborn_class_map_path() -> Path:
+    """Return the approved manifest path, independent of the caller's cwd."""
+    repository_root = Path(__file__).resolve().parents[3]
+    return repository_root / "02_datasets" / "manifests" / "paderborn_bearing_class_map.csv"
+
+
+def _load_paderborn_class_map() -> dict[str, dict[str, object]]:
+    """Read and validate the owner-approved Paderborn class-map CSV.
+
+    Labels and inclusion status come only from this manifest. In particular,
+    bearing IDs are never classified from their filename prefixes.
+    """
+    path = _paderborn_class_map_path()
+    try:
+        stream = path.open("r", newline="", encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Cannot read Paderborn class map at {path}: {exc}") from exc
+
+    rows_by_id: dict[str, dict[str, object]] = {}
+    try:
+        with stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != list(_PADERBORN_CLASS_MAP_FIELDS):
+                raise ValueError(
+                    f"Malformed Paderborn class map {path}: expected columns "
+                    f"{list(_PADERBORN_CLASS_MAP_FIELDS)!r}, got {reader.fieldnames!r}"
+                )
+            for row in reader:
+                row_number = reader.line_num
+                if None in row:
+                    raise ValueError(
+                        f"Malformed Paderborn class map {path}, line {row_number}: "
+                        "row has more fields than the header"
+                    )
+                if any(row.get(field_name) is None for field_name in _PADERBORN_CLASS_MAP_FIELDS):
+                    raise ValueError(
+                        f"Malformed Paderborn class map {path}, line {row_number}: "
+                        "row has fewer fields than the header"
+                    )
+                for field_name in _PADERBORN_CLASS_MAP_FIELDS:
+                    value = row[field_name]
+                    if not value or value != value.strip():
+                        raise ValueError(
+                            f"Malformed Paderborn class map {path}, line {row_number}: "
+                            f"{field_name!r} must be non-empty and have no surrounding whitespace"
+                        )
+
+                bearing_id = row["bearing_id"]
+                if bearing_id in rows_by_id:
+                    raise ValueError(
+                        f"Duplicate bearing_id {bearing_id!r} in Paderborn class map "
+                        f"{path} at line {row_number}"
+                    )
+                try:
+                    label = int(row["label"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Malformed label {row['label']!r} for bearing {bearing_id!r} "
+                        f"in Paderborn class map {path}, line {row_number}"
+                    ) from exc
+                if str(label) != row["label"]:
+                    raise ValueError(
+                        f"Malformed non-canonical label {row['label']!r} for bearing "
+                        f"{bearing_id!r} in Paderborn class map {path}, line {row_number}"
+                    )
+
+                class_name = row["class_name"]
+                status = row["stage1_status"]
+                if status == "include":
+                    if label not in {0, 1, 2}:
+                        raise ValueError(
+                            f"Inconsistent mapping for bearing {bearing_id!r} in "
+                            f"{path}, line {row_number}: included labels must be one "
+                            f"of 0, 1, or 2, got {label}"
+                        )
+                    if (class_name, label) not in _PADERBORN_INCLUDED_CLASSES:
+                        raise ValueError(
+                            f"Inconsistent class_name/label for included bearing "
+                            f"{bearing_id!r} in {path}, line {row_number}: "
+                            f"{class_name!r}/{label}"
+                        )
+                elif status == "exclude":
+                    if class_name != "Combined" or label != -1:
+                        raise ValueError(
+                            f"Inconsistent excluded mapping for bearing {bearing_id!r} "
+                            f"in {path}, line {row_number}: expected Combined/-1, "
+                            f"got {class_name!r}/{label}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Invalid stage1_status {status!r} for bearing {bearing_id!r}; "
+                        "expected 'include' or 'exclude'"
+                    )
+
+                validated_row: dict[str, object] = dict(row)
+                validated_row["label"] = label
+                rows_by_id[bearing_id] = validated_row
+    except csv.Error as exc:
+        raise ValueError(f"Malformed Paderborn class map {path}: {exc}") from exc
+
+    if not rows_by_id:
+        raise ValueError(f"Paderborn class map {path} contains no bearing mappings")
+    return rows_by_id
+
+
+def _parse_paderborn_recording_filename(mat_path: str | os.PathLike) -> tuple[str, str, str]:
+    """Parse ``<condition>_<bearing_id>_<recording_id>.mat`` exactly."""
+    filename = os.path.basename(os.fspath(mat_path))
+    stem, extension = os.path.splitext(filename)
+    if extension.lower() != ".mat":
+        raise PuRecordingError(
+            f"Paderborn recording filename {filename!r} must have a .mat extension"
+        )
+    parts = stem.split("_")
+    if len(parts) != 5 or any(not part for part in parts):
+        raise PuRecordingError(
+            f"Malformed Paderborn recording filename {filename!r}: expected "
+            "<condition_code>_<bearing_id>_<recording_id>.mat, for example "
+            "N09_M07_F10_KA01_1.mat"
+        )
+    condition_code = "_".join(parts[:3])
+    bearing_id, recording_id = parts[3], parts[4]
+    if condition_code not in CONDITION_CODE_MAP:
+        raise PuRecordingError(
+            f"Unsupported condition code {condition_code!r} in {filename!r}; "
+            f"supported: {sorted(CONDITION_CODE_MAP)}"
+        )
+    return bearing_id, condition_code, recording_id
+
 
 @dataclass
 class LoadedDataset:
     """One loaded dataset (CWRU / PU / SEU) with all 5 representations.
 
-    `uids` is a per-window array of `physical_bearing_uid` strings.
+    For pilot inputs, `uids` retains the per-window manifest UID semantics.
+    `RealPaderbornDataset` preserves recording-stem `uids` for compatibility
+    and exposes a separate `physical_bearing_uids` array for physical grouping.
     `speed_estimates` is a per-window array of the IDFT 1X tracker output
     (Hz). `true_speeds` is the per-window nominal speed (Hz).
     `resample_lens` should be a single integer for all rows after
@@ -243,6 +394,17 @@ def apply_zscore(X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray
 
 @dataclass
 class RealPaderbornDataset(LoadedDataset):
+    """Real PU windows with both legacy recording and physical identities.
+
+    ``uids`` and ``unique_uids`` intentionally retain their legacy,
+    recording-stem identity semantics. ``physical_bearing_uids`` is the
+    separate per-window bearing key that future real-data grouping must use;
+    this class does not define or implement a Stage 1 partition.
+
+    ``source_files`` and ``window_metadata`` preserve recording traceability.
+    ``recording_exclusion_log`` contains one entry per Combined recording
+    explicitly skipped by :func:`load_real_paderborn_dataset`.
+    """
     condition_codes: np.ndarray
     source_files: np.ndarray
     window_indices: np.ndarray
@@ -255,6 +417,91 @@ class RealPaderbornDataset(LoadedDataset):
     window_duration_s: np.ndarray
     window_span_s: np.ndarray
     window_metadata: list
+    physical_bearing_uids: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=object)
+    )
+    recording_exclusion_log: list[dict[str, str]] = field(default_factory=list)
+
+
+def _assert_real_paderborn_window_alignment(ds: RealPaderbornDataset) -> None:
+    """Reject a real-PU result whose per-window data or metadata drift apart."""
+    n_windows = int(ds.labels.shape[0])
+    per_window_fields = (
+        "r1_raw",
+        "r1_env",
+        "r2_raw",
+        "r2_env",
+        "r3_order",
+        "labels",
+        "uids",
+        "speed_estimates",
+        "true_speeds",
+        "condition_codes",
+        "source_files",
+        "window_indices",
+        "nominal_speed_hz_per_window",
+        "measured_speed_hz_mean",
+        "measured_speed_hz_min",
+        "measured_speed_hz_max",
+        "nominal_revolutions_per_window",
+        "measured_revolutions_per_window",
+        "window_duration_s",
+        "window_span_s",
+        "physical_bearing_uids",
+    )
+    for field_name in per_window_fields:
+        value = getattr(ds, field_name)
+        if not isinstance(value, np.ndarray) or value.ndim == 0 or value.shape[0] != n_windows:
+            shape = getattr(value, "shape", None)
+            raise ValueError(
+                f"RealPaderbornDataset.{field_name} has first dimension {shape}; "
+                f"expected {n_windows} windows"
+            )
+    if len(ds.window_metadata) != n_windows:
+        raise ValueError(
+            f"RealPaderbornDataset.window_metadata has {len(ds.window_metadata)} rows; "
+            f"expected {n_windows} windows"
+        )
+
+
+def _empty_real_paderborn_dataset(
+    *,
+    window_size: int,
+    fs_out: int,
+    recording_exclusion_log: list[dict[str, str]],
+) -> RealPaderbornDataset:
+    """Build the correctly shaped result when every input was excluded."""
+    empty_objects = lambda: np.empty(0, dtype=object)
+    empty_floats = lambda: np.empty(0, dtype=np.float32)
+    ds = RealPaderbornDataset(
+        name="PU",
+        r1_raw=np.empty((0, 1, window_size), dtype=np.float32),
+        r1_env=np.empty((0, 1, window_size), dtype=np.float32),
+        r2_raw=np.empty((0, 1024), dtype=np.float32),
+        r2_env=np.empty((0, 1024), dtype=np.float32),
+        r3_order=np.empty((0, 1024), dtype=np.float32),
+        labels=np.empty(0, dtype=np.int64),
+        uids=empty_objects(),
+        speed_estimates=empty_floats(),
+        true_speeds=empty_floats(),
+        fs_hz=fs_out,
+        condition_codes=empty_objects(),
+        source_files=empty_objects(),
+        window_indices=np.empty(0, dtype=np.int64),
+        nominal_speed_hz_per_window=empty_floats(),
+        measured_speed_hz_mean=empty_floats(),
+        measured_speed_hz_min=empty_floats(),
+        measured_speed_hz_max=empty_floats(),
+        nominal_revolutions_per_window=empty_floats(),
+        measured_revolutions_per_window=empty_floats(),
+        window_duration_s=empty_floats(),
+        window_span_s=empty_floats(),
+        window_metadata=[],
+        physical_bearing_uids=empty_objects(),
+        recording_exclusion_log=list(recording_exclusion_log),
+    )
+    _assert_real_paderborn_window_alignment(ds)
+    return ds
 
 
 def load_real_paderborn_dataset(
@@ -263,29 +510,102 @@ def load_real_paderborn_dataset(
     window_size: int = 2048,
     hop_size: int = 1024,
     fs_out: int = 12000,
+    exclude_combined: bool = False,
 ):
-    """Load real Paderborn recordings into the experiment dataset format.
+    """Load real PU recordings with labels and physical-bearing identity.
 
-    Uses ``load_pu_recording`` with ``speed_unit="rpm_assumed"`` and default
-    validation thresholds, resamples vibration to 12 kHz via
-    ``decimate_64k_to_12k``, and applies the existing window/hop convention.
-    Nominal (filename-derived) speed is passed to ``extract_representations``.
+    ``mat_paths`` accepts one path or an iterable of paths named exactly
+    ``<condition_code>_<bearing_id>_<recording_id>.mat`` (for example,
+    ``N09_M07_F10_KA01_1.mat``). Conditions are checked against
+    ``CONDITION_CODE_MAP``; bearing labels and Stage 1 status come only from
+    the repository's approved class-map CSV, resolved relative to this
+    module rather than the caller's current directory.
+
+    Included recordings receive the CSV ``class_name`` and integer ``label``.
+    Each emitted window has ``physical_bearing_uids`` equal to the CSV lookup
+    key, while legacy ``uids``/``unique_uids`` remain full recording-stem
+    identities. ``source_files`` and the per-window ``recording_id`` metadata
+    preserve recording traceability. Future real-data partitioning must group
+    on ``physical_bearing_uids``; this loader does not implement Stage 1
+    splitting and does not make the synthetic pilot runner suitable for it.
+
+    By default, a manifest row marked ``Combined``/``exclude`` raises an
+    actionable error. With ``exclude_combined=True``, such recordings are
+    logged and skipped before the MAT signal loader or feature extractor is
+    called. Unknown IDs and malformed/unsupported filenames always raise.
+    If every nonempty input is explicitly excluded, the returned dataset has
+    zero windows with the normal feature dimensions and a populated exclusion
+    log. Empty ``mat_paths`` remains an error.
+
+    Signal processing, nominal-speed forwarding, measured-speed metadata,
+    windowing, angular target length, and strict support are unchanged.
     """
+    if not isinstance(exclude_combined, bool):
+        raise TypeError("exclude_combined must be a bool")
     if isinstance(mat_paths, (str, os.PathLike)):
-        paths = [str(mat_paths)]
+        paths = [os.fspath(mat_paths)]
     else:
-        paths = [str(p) for p in mat_paths]
+        paths = [os.fspath(p) for p in mat_paths]
+    if not paths:
+        raise ValueError("no Paderborn inputs provided")
 
-    parts = []
-    all_window_meta = []
-    global_window_index = 0
+    class_map = _load_paderborn_class_map()
+    class_map_path = _paderborn_class_map_path()
+    parts: list[RealPaderbornDataset] = []
+    recording_exclusion_log: list[dict[str, str]] = []
 
     for mat_path in paths:
+        bearing_id, filename_condition, recording_id = _parse_paderborn_recording_filename(mat_path)
+        filename = os.path.basename(mat_path)
+        map_row = class_map.get(bearing_id)
+        if map_row is None:
+            raise ValueError(
+                f"Unknown Paderborn bearing_id {bearing_id!r} in {filename!r}; "
+                f"no exact bearing_id entry exists in the approved class map {class_map_path}"
+            )
+
+        class_name = str(map_row["class_name"])
+        label = int(map_row["label"])
+        stage1_status = str(map_row["stage1_status"])
+        if stage1_status == "exclude":
+            if not exclude_combined:
+                raise ValueError(
+                    f"Paderborn bearing {bearing_id!r} in {filename!r} is "
+                    f"{class_name} and marked stage1_status='exclude' in the approved "
+                    "class map; this Combined bearing is excluded from the approved "
+                    "Stage 1 classes. Pass exclude_combined=True to skip and log it."
+                )
+            recording_exclusion_log.append({
+                "bearing_id": bearing_id,
+                "source_file": filename,
+                "condition_code": filename_condition,
+                "reason": (
+                    "approved Stage 1 class map marks this Combined bearing "
+                    "stage1_status='exclude' (label -1)"
+                ),
+            })
+            continue
+
+        # Included mappings were validated to be one of the three Stage 1 labels.
+        if label not in {0, 1, 2}:
+            raise ValueError(
+                f"Included Paderborn bearing {bearing_id!r} has invalid label {label}; "
+                "expected one of 0, 1, or 2"
+            )
+
+        # Parse and apply manifest policy before opening signal arrays, allowing
+        # explicit Combined exclusions to be recorded without reading their MATs.
         rec = load_pu_recording(mat_path, speed_unit="rpm_assumed")
         condition_code = rec.metadata["condition_code"]
         if condition_code not in CONDITION_CODE_MAP:
             raise PuRecordingError(
                 f"unsupported condition code {condition_code!r} for {mat_path!r}"
+            )
+        if condition_code != filename_condition or rec.metadata.get("bearing_id") != bearing_id:
+            raise PuRecordingError(
+                f"Paderborn filename metadata mismatch for {filename!r}: parsed "
+                f"{filename_condition}/{bearing_id}, loader returned "
+                f"{condition_code!r}/{rec.metadata.get('bearing_id')!r}"
             )
         nominal_rpm = int(rec.metadata["nominal_rpm"])
         nominal_speed_hz = float(nominal_rpm) / 60.0
@@ -304,9 +624,10 @@ def load_real_paderborn_dataset(
         )
         n_windows = int(reps["r1_raw"].shape[0])
 
-        labels = np.full(n_windows, -1, dtype=np.int64)
-        uid = os.path.splitext(os.path.basename(mat_path))[0]
+        labels = np.full(n_windows, label, dtype=np.int64)
+        uid = os.path.splitext(filename)[0]
         uids = np.full(n_windows, uid, dtype=object)
+        physical_bearing_uids = np.full(n_windows, bearing_id, dtype=object)
         dataset = np.full(n_windows, "PU", dtype=object)
 
         orig_ts = np.asarray(rec.vibration_time, dtype=np.float64).ravel()
@@ -314,7 +635,8 @@ def load_real_paderborn_dataset(
         rec_start = float(orig_ts[0]) if orig_ts.size else 0.0
 
         cond_arr = np.full(n_windows, condition_code, dtype=object)
-        source_arr = np.full(n_windows, os.path.basename(mat_path), dtype=object)
+        source_file = filename
+        source_arr = np.full(n_windows, source_file, dtype=object)
         window_indices = np.arange(n_windows, dtype=np.int64)
         nominal_arr = np.full(n_windows, nominal_speed_hz, dtype=np.float32)
         meas_mean = np.empty(n_windows, dtype=np.float32)
@@ -324,6 +646,7 @@ def load_real_paderborn_dataset(
         meas_revs = np.empty(n_windows, dtype=np.float32)
         dur_arr = np.full(n_windows, window_size / float(fs_out), dtype=np.float32)
         span_arr = np.full(n_windows, (window_size - 1) / float(fs_out), dtype=np.float32)
+        window_metadata = []
 
         for w in range(n_windows):
             start_idx = w * hop_size
@@ -345,11 +668,16 @@ def load_real_paderborn_dataset(
             nom_revs[w] = nominal_speed_hz * (window_size / float(fs_out))
             meas_revs[w] = m_mean * (window_size / float(fs_out))
 
-            all_window_meta.append({
+            window_metadata.append({
                 "uid": uid,
+                "bearing_id": bearing_id,
+                "physical_bearing_uid": bearing_id,
+                "recording_id": recording_id,
                 "condition_code": condition_code,
-                "source_file": os.path.basename(mat_path),
+                "source_file": source_file,
                 "window_index": int(w),
+                "class_name": class_name,
+                "label": label,
                 "nominal_speed_hz": nominal_speed_hz,
                 "measured_speed_hz_mean": m_mean,
                 "measured_speed_hz_min": m_min,
@@ -389,21 +717,28 @@ def load_real_paderborn_dataset(
             measured_revolutions_per_window=meas_revs,
             window_duration_s=dur_arr,
             window_span_s=span_arr,
-            window_metadata=all_window_meta[-n_windows:],
+            window_metadata=window_metadata,
+            physical_bearing_uids=physical_bearing_uids,
         )
+        _assert_real_paderborn_window_alignment(ds)
         parts.append(ds)
 
     if not parts:
-        raise ValueError("no Paderborn inputs provided")
+        # This branch is reachable only when all nonempty input paths were
+        # known Combined bearings and explicitly excluded above.
+        return _empty_real_paderborn_dataset(
+            window_size=window_size,
+            fs_out=fs_out,
+            recording_exclusion_log=recording_exclusion_log,
+        )
 
     if len(parts) == 1:
-        return parts[0]
+        out_ds = parts[0]
+        out_ds.recording_exclusion_log = list(recording_exclusion_log)
+        _assert_real_paderborn_window_alignment(out_ds)
+        return out_ds
 
-    # Concatenate multiple inputs.
-    concat_meta = []
-    for p in parts:
-        concat_meta.extend(p.window_metadata)
-
+    # Concatenate each per-window field while retaining every exclusion entry.
     out_ds = RealPaderbornDataset(
         name="PU",
         r1_raw=np.concatenate([p.r1_raw for p in parts], axis=0),
@@ -427,6 +762,9 @@ def load_real_paderborn_dataset(
         measured_revolutions_per_window=np.concatenate([p.measured_revolutions_per_window for p in parts]),
         window_duration_s=np.concatenate([p.window_duration_s for p in parts]),
         window_span_s=np.concatenate([p.window_span_s for p in parts]),
-        window_metadata=concat_meta,
+        window_metadata=[metadata for p in parts for metadata in p.window_metadata],
+        physical_bearing_uids=np.concatenate([p.physical_bearing_uids for p in parts]),
+        recording_exclusion_log=list(recording_exclusion_log),
     )
+    _assert_real_paderborn_window_alignment(out_ds)
     return out_ds

@@ -53,12 +53,21 @@ def test_required_metadata_fields():
     p = _make_mat(td, "N15_M07_F10_KA01_1.mat", n=64000)
     ds = load_real_paderborn_dataset(p, window_size=2048, hop_size=1024)
     m = ds.window_metadata[0]
-    for key in ["uid", "condition_code", "source_file", "window_index",
-                "nominal_speed_hz", "measured_speed_hz_mean",
+    for key in ["uid", "bearing_id", "physical_bearing_uid", "recording_id",
+                "condition_code", "source_file", "window_index", "class_name",
+                "label", "nominal_speed_hz", "measured_speed_hz_mean",
                 "measured_speed_hz_min", "measured_speed_hz_max"]:
         assert key in m
-    assert ds.measured_speed_hz_mean.shape[0] == ds.r1_raw.shape[0]
+    n = ds.r1_raw.shape[0]
+    assert ds.measured_speed_hz_mean.shape[0] == n
+    assert ds.physical_bearing_uids.shape == (n,)
+    assert np.all(ds.physical_bearing_uids == "KA01")
+    assert np.all(ds.labels == 1)
     assert ds.condition_codes[0] == "N15_M07_F10"
+    assert m["bearing_id"] == m["physical_bearing_uid"] == "KA01"
+    assert m["recording_id"] == "1"
+    assert m["class_name"] == "Outer_Race"
+    assert m["label"] == 1
 
 
 def test_condition_code_rejection():
