@@ -48,7 +48,7 @@ else:
 
 
 DEFAULT_SEEDS = (42, 1337, 2026, 7, 99)
-DEFAULT_REPRESENTATIONS = tuple(ds_mod.REPRESENTATIONS)
+DEFAULT_REPRESENTATIONS = ("R1_Raw", "R3_Order")
 EVALUATION_VIEWS = ("test_in_condition", "test_primary", "test_secondary")
 FIXED_LABELS = (0, 1, 2)
 RESULT_COLUMNS = (
@@ -142,7 +142,7 @@ def _make_argparser() -> argparse.ArgumentParser:
                         help="Required output directory; outputs are never placed by default in the repository")
     parser.add_argument("--reps", type=_parse_representations,
                         default=list(DEFAULT_REPRESENTATIONS),
-                        help="Comma-separated representations (default: all five Stage 1 representations)")
+                        help="Comma-separated representations (default: R1_Raw,R3_Order; any supported representation may be selected explicitly)")
     parser.add_argument("--seeds", type=_parse_seeds,
                         default=list(DEFAULT_SEEDS),
                         help="Comma-separated seeds (default: 42,1337,2026,7,99)")
@@ -574,6 +574,129 @@ def _run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid.uuid4().hex[:8]
 
 
+def _effective_preprocessing_record() -> dict[str, Any]:
+    """Describe the current Stage 1 source path without treating config as contract."""
+    return {
+        "record_kind": "source-grounded descriptive record; not a processing configuration",
+        "source_paths": [
+            "04_experiments/002_cross_machine_invariance/src/datasets.py",
+            "04_experiments/002_cross_machine_invariance/src/preprocess.py",
+            "04_experiments/002_cross_machine_invariance/src/preprocess_decim.py",
+            "tools/paderborn_mat_reader/recording.py",
+        ],
+        "legacy_declared_configuration": {
+            "source_file": "04_experiments/002_cross_machine_invariance/config/experiment_config.json",
+            "status": "legacy declarations only; not a complete effective processing contract",
+            "sampling_rate_harmonization": {
+                "target_fs_hz": 12000,
+                "resampling_method": "polyphase_anti_alias",
+                "numtaps": 1395,
+                "cutoff_hz": 5500,
+                "design": "kaiser_60dB",
+            },
+            "windowing": {
+                "window_length_samples": 2048,
+                "hop_length_samples": 1024,
+                "window_function": "hann",
+            },
+            "preprocessing": {
+                "detrend": "linear",
+                "bandpass_filter": {
+                    "type": "butterworth",
+                    "order": 4,
+                    "lowcut_hz": 500,
+                    "highcut_hz": 5000,
+                },
+                "envelope_extraction": {
+                    "method": "hilbert_magnitude",
+                    "squared": False,
+                },
+                "shaft_speed_estimation": {
+                    "method": "idft_parabolic_interpolation",
+                    "fft_length": 2048,
+                    "search_tolerance_percent": 15.0,
+                },
+                "angular_resampling": {
+                    "samples_per_revolution": 64,
+                    "max_orders": 16.0,
+                    "interpolation_method": "linear",
+                },
+                "spectral_transform": {
+                    "fft_length": 2048,
+                    "output_bins": 1024,
+                    "order_output_bins": 512,
+                },
+            },
+            "R3_Order": {
+                "input_dim": [1024],
+                "zero_padded_from": 512,
+            },
+        },
+        "effective_stage1_implementation": {
+            "sampling": {
+                "nominal_input_sampling_rate_hz": 64000,
+                "output_sampling_rate_hz": 12000,
+                "polyphase_ratio_up": 3,
+                "polyphase_ratio_down": 16,
+                "output_length_convention": "ceil(n_input_samples * 3 / 16)",
+            },
+            "classification_windowing": {
+                "window_length_samples": 2048,
+                "hop_length_samples": 1024,
+                "overlap_samples": 1024,
+                "R1_time_window_taper": "none",
+                "spectral_fft_taper": "np.hanning on R2 and R3 FFT inputs",
+            },
+            "mean_subtraction_and_detrending": {
+                "whole_decimated_signal_mean_subtracted_before_windowing": True,
+                "envelope_mean_subtracted_after_hilbert_magnitude": True,
+                "linear_detrending_applied": False,
+                "legacy_config_declares": "linear detrending",
+            },
+            "R1_Raw_source": {
+                "array": "mean-centered decimated vibration signal (sig), before bandpass filtering",
+                "distinction": "sig_bp is a separate bandpassed array used to construct the envelope; R1_Raw windows are copied from sig, not sig_bp",
+            },
+            "bandpass_and_envelope": {
+                "bandpass": "4th-order Butterworth, 500-5000 Hz, zero-phase scipy.signal.filtfilt",
+                "envelope": "Hilbert magnitude abs(hilbert(sig_bp)); not squared",
+            },
+            "angular_resampling": {
+                "target_samples": 128,
+                "samples_per_revolution": 64,
+                "nominal_revolutions": 2,
+                "interpolation": "linear",
+                "support_check": "strictly rejects requested interpolation times outside the observed window",
+                "anti_aliasing_validation": "not established by the timestamp-support check",
+            },
+            "R3_Order_spectrum": {
+                "transform": "128-point real FFT (rfft) of the Hann-windowed angular envelope",
+                "natural_rfft_bins": 65,
+                "output_feature_bins": 1024,
+                "padding": "natural spectrum is zero-padded to 1024; bins 512-1023 are explicitly zeroed",
+            },
+            "speed_estimation_and_fallback": {
+                "tracker": "per-window IDFT 1X peak on a mean-centered, Hann-windowed envelope; 2048-point real FFT; search around condition nominal speed +/-15%; parabolic peak interpolation",
+                "tracker_returns_condition_nominal_when": [
+                    "fewer than three bins fall in the search band",
+                    "the selected peak is at a spectrum edge",
+                    "the parabolic interpolation denominator has magnitude below 1e-6",
+                ],
+                "angular_resampler_fallback": "if tracker speed is <=0 or >200 Hz, use max(1, target_samples // samples_per_revolution) * output_sampling_rate / classification_window_length",
+                "measured_speed_role": "reader validates/measures speed and the loader retains per-window measured-speed metadata; the measured-speed array does not drive the current R3 angular resampling",
+            },
+        },
+        "unresolved_scientific_validation": {
+            "angular_antialiasing": "not established by the interpolation-support check",
+            "linear_detrending": "effective mean subtraction is not the legacy-configured linear detrending",
+            "R3_bin_contract": "effective 65 natural bins differ from the legacy-declared 512 order bins",
+            "embedded_resource_compliance": "not measured",
+            "diagnostic_accuracy": "successful execution is not proof of diagnostic accuracy",
+            "metadata_scope": "this descriptive record does not resolve or validate these limitations",
+        },
+    }
+
+
 def _new_manifest(args: argparse.Namespace, run_id: str, paths: Mapping[str, Path]) -> dict[str, Any]:
     split_path = split_mod._SPLIT_PATH
     class_map_path = ds_mod._paderborn_class_map_path()
@@ -614,6 +737,7 @@ def _new_manifest(args: argparse.Namespace, run_id: str, paths: Mapping[str, Pat
         "representations": list(args.reps),
         "class_weights_enabled": not args.no_class_weights,
         "normalization_source": "X_train only; frozen mean/std applied to validation and each test view",
+        "effective_preprocessing": _effective_preprocessing_record(),
         "training_batch_policy": (
             "drop_last_train=True with configured batch_size. Both model families use BatchNorm1d; "
             "the MLP BatchNorm1d path cannot train on a singleton batch. The trainer drops the "

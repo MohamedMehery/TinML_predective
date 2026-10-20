@@ -223,12 +223,34 @@ def test_dry_run_scans_exact_inventory_and_never_loads_or_trains(tmp_path, monke
 
     monkeypatch.setattr(RUN.split_mod, "check_coverage", check_spy)
 
-    def forbidden(*args, **kwargs):
-        pytest.fail("dry-run must not load MAT payloads or import/train a model")
+    def forbidden(operation):
+        def fail_if_called(*args, **kwargs):
+            pytest.fail(f"dry-run must not perform {operation}")
 
-    monkeypatch.setattr(RUN.ds_mod, "load_real_paderborn_dataset", forbidden)
-    monkeypatch.setattr(RUN, "_load_training_api", forbidden)
-    monkeypatch.setattr(RUN, "_load_evaluation_api", forbidden)
+        return fail_if_called
+
+    monkeypatch.setattr(
+        RUN.ds_mod,
+        "load_real_paderborn_dataset",
+        forbidden("MAT loading"),
+    )
+    monkeypatch.setattr(
+        RUN.ds_mod,
+        "extract_representations",
+        forbidden("feature extraction"),
+    )
+    # Training/model construction/prediction are reachable only through the
+    # lazy training API; forbidding that boundary proves dry-run never enters it.
+    monkeypatch.setattr(
+        RUN,
+        "_load_training_api",
+        forbidden("model construction, training, or prediction"),
+    )
+    monkeypatch.setattr(
+        RUN,
+        "_load_evaluation_api",
+        forbidden("evaluation or prediction"),
+    )
 
     expected = RUN.discover_mat_files(root)
     exit_code = RUN.main(_run_args(root, out, reps="R1_Raw", seeds="42", extra=("--dry-run",)))
@@ -245,6 +267,44 @@ def test_dry_run_scans_exact_inventory_and_never_loads_or_trains(tmp_path, monke
     assert manifest["coverage"]["input_file_count"] == len(expected)
     assert rows == []
     assert manifest["coverage_evidence_note"].startswith("Filename coverage")
+    effective = manifest["effective_preprocessing"]
+    assert effective["record_kind"] == (
+        "source-grounded descriptive record; not a processing configuration"
+    )
+    assert "not a complete effective processing contract" in effective[
+        "legacy_declared_configuration"
+    ]["status"]
+    assert effective["legacy_declared_configuration"]["preprocessing"]["detrend"] == "linear"
+    implementation = effective["effective_stage1_implementation"]
+    assert implementation["sampling"] == {
+        "nominal_input_sampling_rate_hz": 64000,
+        "output_sampling_rate_hz": 12000,
+        "polyphase_ratio_up": 3,
+        "polyphase_ratio_down": 16,
+        "output_length_convention": "ceil(n_input_samples * 3 / 16)",
+    }
+    assert implementation["classification_windowing"]["window_length_samples"] == 2048
+    assert implementation["classification_windowing"]["hop_length_samples"] == 1024
+    assert implementation["mean_subtraction_and_detrending"]["linear_detrending_applied"] is False
+    assert "before bandpass filtering" in implementation["R1_Raw_source"]["array"]
+    assert "not sig_bp" in implementation["R1_Raw_source"]["distinction"]
+    assert implementation["bandpass_and_envelope"]["envelope"].startswith("Hilbert magnitude")
+    speed = implementation["speed_estimation_and_fallback"]
+    assert speed["tracker_returns_condition_nominal_when"]
+    assert "<=0 or >200 Hz" in speed["angular_resampler_fallback"]
+    assert "does not drive" in speed["measured_speed_role"]
+    assert implementation["angular_resampling"]["target_samples"] == 128
+    assert implementation["angular_resampling"]["samples_per_revolution"] == 64
+    assert implementation["angular_resampling"]["nominal_revolutions"] == 2
+    assert implementation["R3_Order_spectrum"]["natural_rfft_bins"] == 65
+    assert implementation["R3_Order_spectrum"]["output_feature_bins"] == 1024
+    limitations = effective["unresolved_scientific_validation"]
+    assert "not established" in limitations["angular_antialiasing"]
+    assert "not the legacy-configured linear detrending" in limitations["linear_detrending"]
+    assert "65 natural bins" in limitations["R3_bin_contract"]
+    assert "not measured" in limitations["embedded_resource_compliance"]
+    assert "not proof" in limitations["diagnostic_accuracy"]
+    assert "does not resolve" in limitations["metadata_scope"]
     assert "filename-only" in RUN._make_argparser().description
     assert "does not verify MAT" in summary
 
@@ -524,7 +584,12 @@ def test_default_cli_configuration_and_repository_safe_output_argument():
         ["--data-root", "/data/PU", "--out-dir", "/tmp/stage1"]
     )
     assert args.seeds == [42, 1337, 2026, 7, 99]
-    assert args.reps == list(D.REPRESENTATIONS)
+    assert args.reps == ["R1_Raw", "R3_Order"]
+    all_representations = list(D.REPRESENTATIONS)
+    assert RUN._parse_representations(",".join(all_representations)) == all_representations
+    help_text = " ".join(RUN._make_argparser().format_help().split())
+    assert "default: R1_Raw,R3_Order" in help_text
+    assert "any supported representation may be selected explicitly" in help_text
     assert args.max_recordings_per_pair is None
     assert args.no_class_weights is False
     assert args.dry_run is False
