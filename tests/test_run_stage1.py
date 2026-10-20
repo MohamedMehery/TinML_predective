@@ -188,6 +188,31 @@ def _install_fakes(monkeypatch, dataset):
     return traces
 
 
+def _install_prevalidator(
+    monkeypatch,
+    *,
+    gate_failures: dict[str, str] | None = None,
+    fatal_errors: dict[str, tuple[type[BaseException], str]] | None = None,
+):
+    """Mock reader-level prevalidation; fixtures remain empty and unopened."""
+    gate_failures = gate_failures or {}
+    fatal_errors = fatal_errors or {}
+    calls = []
+
+    def load_pu_recording(path, *, speed_unit):
+        path = Path(path)
+        calls.append({"path": path, "speed_unit": speed_unit})
+        if path.name in fatal_errors:
+            error_type, message = fatal_errors[path.name]
+            raise error_type(message)
+        if path.name in gate_failures:
+            raise D.PuRecordingError(gate_failures[path.name])
+        return object()
+
+    monkeypatch.setattr(RUN.ds_mod, "load_pu_recording", load_pu_recording)
+    return calls
+
+
 def _run_args(root: Path, out: Path, *, reps="R1_Raw", seeds="42", extra=()):
     return [
         "--data-root", str(root),
@@ -591,8 +616,10 @@ def test_default_cli_configuration_and_repository_safe_output_argument():
     assert "default: R1_Raw,R3_Order" in help_text
     assert "any supported representation may be selected explicitly" in help_text
     assert args.max_recordings_per_pair is None
+    assert args.exclude_gate_failures is False
     assert args.no_class_weights is False
     assert args.dry_run is False
+    assert "--exclude-gate-failures" in RUN._make_argparser().format_help()
     assert "out_dir" in RUN._jsonable_arguments(args)
 
 
@@ -645,3 +672,341 @@ def test_partition_contract_failure_fails_all_planned_combinations(tmp_path, mon
         "test_in_condition", "test_primary"
     }
     assert traces["train_calls"] == []
+
+
+def test_gate_flag_off_keeps_loader_first_failure_fatal_without_prevalidation(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "data"
+    _make_inventory(root, include_secondary=False)
+    out = tmp_path / "out"
+    loader_calls = []
+    prevalidation_calls = []
+    message = "endpoint rate gate failed: 64064.0 Hz vs nominal 64000.0 Hz"
+
+    def load_dataset(paths, *, exclude_combined):
+        loader_calls.append(list(paths))
+        raise D.PuRecordingError(message)
+
+    def forbidden_prevalidation(*args, **kwargs):
+        prevalidation_calls.append((args, kwargs))
+        pytest.fail("flag-off mode must not run the gate prevalidation pass")
+
+    monkeypatch.setattr(RUN.ds_mod, "load_real_paderborn_dataset", load_dataset)
+    monkeypatch.setattr(RUN.ds_mod, "load_pu_recording", forbidden_prevalidation)
+
+    code = RUN.main(_run_args(root, out))
+
+    assert code == 1
+    assert len(loader_calls) == 1
+    assert prevalidation_calls == []
+    manifest, _, summary = _read_outputs(out)
+    assert manifest["status"] == "FAILED_LOADING"
+    assert manifest["error"]["phase"] == "MAT_LOADING_AND_FEATURE_EXTRACTION"
+    assert manifest["error"]["message"] == message
+    gate = manifest["recording_gate_exclusion"]
+    assert gate["enabled"] is False
+    assert gate["prevalidation_performed"] is False
+    assert gate["prevalidation_skipped_reason"] == "flag_disabled"
+    assert gate["counts"]["passed"] is None
+    assert gate["counts"]["excluded"] == 0
+    assert "--exclude-gate-failures was not enabled" in summary
+
+
+def test_approved_gate_exclusions_are_audited_and_only_passing_files_reach_loader(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "data"
+    _make_inventory(root, include_secondary=False)
+    split = S.load_split()
+    class_map = D._load_paderborn_class_map()
+    outer_train = next(
+        bearing
+        for bearing in split["allocations"]["train"]
+        if int(class_map[bearing]["label"]) == 1
+    )
+    healthy_test = next(
+        bearing
+        for bearing in split["allocations"]["test"]
+        if int(class_map[bearing]["label"]) == 0
+    )
+    train_condition = split["conditions"]["train"]
+    test_condition = split["conditions"]["test_primary"]
+    _touch(root / "additional" / f"{train_condition}_{outer_train}_2.mat")
+    _touch(root / "additional" / f"{test_condition}_{healthy_test}_2.mat")
+
+    endpoint_message = "endpoint rate gate failed: 64064.0 Hz vs nominal 64000.0 Hz"
+    residual_message = "timestamp residual gate failed: 1.5625e-05 s >= 1.5625e-05 s"
+    gate_failures = {
+        f"{train_condition}_{outer_train}_1.mat": endpoint_message,
+        f"{test_condition}_{healthy_test}_1.mat": residual_message,
+    }
+    calls = _install_prevalidator(monkeypatch, gate_failures=gate_failures)
+    traces = _install_fakes(monkeypatch, _make_fake_dataset(include_secondary=False))
+    out = tmp_path / "out"
+
+    code = RUN.main(
+        _run_args(root, out, extra=("--exclude-gate-failures",))
+    )
+
+    assert code == 0
+    assert len(calls) == 42  # All approved candidates, before any per-pair cap.
+    assert all(call["speed_unit"] == "rpm_assumed" for call in calls)
+    assert len(traces["loader_calls"]) == 1
+    loader_inputs = traces["loader_calls"][0]["paths"]
+    assert len(loader_inputs) == 40
+    assert all(path.name not in gate_failures for path in loader_inputs)
+    assert all(
+        any(path.name == f"{Path(name).stem[:-1]}2.mat" for path in loader_inputs)
+        for name in gate_failures
+    )
+
+    manifest, _, summary = _read_outputs(out)
+    gate = manifest["recording_gate_exclusion"]
+    assert manifest["cli_arguments"]["exclude_gate_failures"] is True
+    assert gate["enabled"] is True
+    assert gate["prevalidation_performed"] is True
+    assert gate["prevalidation_status"] == "COMPLETE"
+    assert gate["reader_thresholds"] == "load_pu_recording defaults; no threshold overrides"
+    assert gate["counts"] == {"total": 42, "passed": 40, "excluded": 2}
+    assert gate["exclusions_by_reason"] == {
+        "endpoint_rate_gate": 1,
+        "timestamp_residual_gate": 1,
+    }
+    assert gate["exclusions_by_class"]["Outer_Race"] == 1
+    assert gate["exclusions_by_class"]["Healthy"] == 1
+    assert gate["exclusions_by_role"]["train"] == 1
+    assert gate["exclusions_by_role"]["test_primary"] == 1
+    assert gate["exclusions_by_condition"][train_condition] == 1
+    assert gate["exclusions_by_condition"][test_condition] == 1
+    assert len(gate["exclusion_list"]) == 2
+    by_name = {Path(row["path"]).name: row for row in gate["exclusion_list"]}
+    endpoint = by_name[f"{train_condition}_{outer_train}_1.mat"]
+    assert endpoint["bearing_id"] == outer_train
+    assert endpoint["physical_bearing_uid"] == outer_train
+    assert endpoint["condition_code"] == train_condition
+    assert endpoint["recording_id"] == "1"
+    assert endpoint["role"] == "train"
+    assert endpoint["gate_name"] == "endpoint_rate_gate"
+    assert endpoint["error_message"] == endpoint_message
+    assert endpoint["first_failure_only"] is True
+    residual = by_name[f"{test_condition}_{healthy_test}_1.mat"]
+    assert residual["role"] == "test_primary"
+    assert residual["gate_name"] == "timestamp_residual_gate"
+    assert residual["error_message"] == residual_message
+
+    attrition = gate["attrition"]
+    assert attrition["by_partition"]["train"]["denominator"] == 14
+    assert attrition["by_partition"]["train"]["passed"] == 13
+    assert attrition["by_partition"]["train"]["excluded"] == 1
+    assert attrition["by_partition"]["train"]["excluded_percent"] == pytest.approx(7.14)
+    assert attrition["by_condition"][train_condition]["denominator"] == 30
+    assert attrition["by_physical_bearing"][outer_train]["excluded"] == 1
+    assert attrition["by_class"]["Outer_Race"]["excluded"] == 1
+    assert attrition["by_class"]["Healthy"]["excluded"] == 1
+
+    pair_counts = gate["post_exclusion_per_pair_counts"]
+    endpoint_pair = next(
+        row for row in pair_counts
+        if row["bearing_id"] == outer_train and row["condition_code"] == train_condition
+    )
+    residual_pair = next(
+        row for row in pair_counts
+        if row["bearing_id"] == healthy_test and row["condition_code"] == test_condition
+    )
+    assert (endpoint_pair["total"], endpoint_pair["passed"], endpoint_pair["excluded"]) == (2, 1, 1)
+    assert (residual_pair["total"], residual_pair["passed"], residual_pair["excluded"]) == (2, 1, 1)
+    assert manifest["coverage_after_gate_exclusion"]["missing_required"] == []
+    assert manifest["coverage_after_gate_exclusion"]["secondary_condition_gaps"]
+    assert manifest["selected_file_count"] == 40
+    assert manifest["loader_input_files"] == manifest["selected_file_list"]
+    assert manifest["excluded_file_count"] == 2
+    survey = gate["owner_provided_survey_context"]
+    assert survey["total_files"] == 1020
+    assert survey["passed_files"] == 599
+    assert survey["failed_files"] == 421
+    assert survey["provenance"].endswith("not independently reproduced")
+    assert gate["timing_irregularity_cause"].startswith("unknown")
+    assert "gate_prevalidation_counts: total=42; passed=40; excluded=2" in summary
+    assert "timing_irregularity_cause: unknown" in summary
+    assert "gate attrition by physical bearing" in summary
+    assert "selection bias" in summary
+
+
+def test_nonapproved_reader_errors_and_non_pu_errors_are_fatal(
+    tmp_path, monkeypatch
+):
+    cases = [
+        (RuntimeError, "synthetic MAT load failure"),
+        (D.PuRecordingError, "required channel 'speed' missing in synthetic.mat"),
+        (D.PuRecordingError, "timestamp residual warning: not the approved gate message"),
+    ]
+    for index, (error_type, message) in enumerate(cases):
+        root = tmp_path / f"data-{index}"
+        paths = _make_inventory(root, include_secondary=False)
+        first_path = min(paths, key=lambda path: path.relative_to(root).as_posix())
+        first_name = first_path.name
+        calls = _install_prevalidator(
+            monkeypatch,
+            fatal_errors={first_name: (error_type, message)},
+        )
+        out = tmp_path / f"out-{index}"
+
+        def forbidden_loader(*args, **kwargs):
+            pytest.fail("fatal prevalidation error must abort before the dataset loader")
+
+        monkeypatch.setattr(RUN.ds_mod, "load_real_paderborn_dataset", forbidden_loader)
+        code = RUN.main(
+            _run_args(root, out, extra=("--exclude-gate-failures",))
+        )
+
+        assert code == 1
+        assert calls and calls[0]["path"].name == first_name
+        manifest, _, _ = _read_outputs(out)
+        assert manifest["status"] == "FAILED_PREFLIGHT"
+        assert manifest["error"]["phase"] == "RECORDING_GATE_PREFLIGHT"
+        assert manifest["error"]["type"] == error_type.__name__
+        assert manifest["error"]["message"] == message
+        gate = manifest["recording_gate_exclusion"]
+        assert gate["prevalidation_status"] == "ABORTED_FATAL_ERROR"
+        assert gate["fatal_path"] == first_path.relative_to(root).as_posix()
+        assert gate["exclusion_list"] == []
+
+
+def test_gate_exclusion_zero_required_pair_coverage_aborts_before_loader(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "data"
+    paths = _make_inventory(root, include_secondary=False)
+    split = S.load_split()
+    first_required = S.check_coverage([])["required_pairs"][0]
+    fail_name = (
+        f"{first_required['condition_code']}_{first_required['bearing_id']}_1.mat"
+    )
+    message = "endpoint rate gate failed: 64064.0 Hz vs nominal 64000.0 Hz"
+    calls = _install_prevalidator(monkeypatch, gate_failures={fail_name: message})
+    out = tmp_path / "out"
+
+    def forbidden_loader(*args, **kwargs):
+        pytest.fail("zero post-exclusion required coverage must abort before loading")
+
+    monkeypatch.setattr(RUN.ds_mod, "load_real_paderborn_dataset", forbidden_loader)
+    code = RUN.main(
+        _run_args(root, out, extra=("--exclude-gate-failures",))
+    )
+
+    assert code == 1
+    assert len(calls) == len(paths)
+    manifest, _, _ = _read_outputs(out)
+    assert manifest["status"] == "FAILED_PREFLIGHT"
+    assert manifest["error"]["phase"] == "RECORDING_GATE_PREFLIGHT"
+    assert "after gate exclusions" in manifest["error"]["message"]
+    post_coverage = manifest["coverage_after_gate_exclusion"]
+    assert len(post_coverage["missing_required"]) == 1
+    assert post_coverage["missing_required"][0]["bearing_id"] == first_required["bearing_id"]
+    assert post_coverage["secondary_condition_gaps"]
+    gate = manifest["recording_gate_exclusion"]
+    assert gate["counts"] == {"total": 40, "passed": 39, "excluded": 1}
+    missing_pair = next(
+        row for row in gate["post_exclusion_per_pair_counts"]
+        if (row["bearing_id"], row["condition_code"])
+        == (first_required["bearing_id"], first_required["condition_code"])
+    )
+    assert missing_pair["passed"] == 0
+
+
+def test_recording_cap_is_applied_to_gate_passing_files_only(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    first_required = S.check_coverage([])["required_pairs"][0]
+    pair = (first_required["bearing_id"], first_required["condition_code"])
+    _make_inventory(root, include_secondary=False, special_pair=pair)
+    failed_name = f"{pair[1]}_{pair[0]}_10.mat"
+    message = "timestamp residual gate failed: 2.0e-05 s >= 1.5625e-05 s"
+    calls = _install_prevalidator(monkeypatch, gate_failures={failed_name: message})
+    traces = _install_fakes(monkeypatch, _make_fake_dataset(include_secondary=False))
+    out = tmp_path / "out"
+
+    code = RUN.main(
+        _run_args(
+            root,
+            out,
+            extra=("--exclude-gate-failures", "--max-recordings-per-pair", "1"),
+        )
+    )
+
+    assert code == 0
+    assert len(calls) == 41
+    assert any(call["path"].name.endswith("_10.mat") for call in calls)
+    assert len(traces["loader_calls"]) == 1
+    selected_names = {path.name for path in traces["loader_calls"][0]["paths"]}
+    assert f"{pair[1]}_{pair[0]}_2.mat" in selected_names
+    assert failed_name not in selected_names
+    manifest, _, _ = _read_outputs(out)
+    group = next(
+        row for row in manifest["memory_guard"]["groups"]
+        if (row["bearing_id"], row["condition_code"]) == pair
+    )
+    assert group["candidate_recording_ids"] == ["2"]
+    assert group["selected_recording_ids"] == ["2"]
+    assert manifest["memory_guard"]["max_recordings_per_pair"] == 1
+    assert manifest["memory_guard"]["recording_cap_applied"] is True
+    assert manifest["memory_guard"]["excluded_by_recording_cap_count"] == 0
+    gate = manifest["recording_gate_exclusion"]
+    assert gate["counts"] == {"total": 41, "passed": 40, "excluded": 1}
+    pair_audit = next(
+        row for row in gate["post_exclusion_per_pair_counts"]
+        if (row["bearing_id"], row["condition_code"]) == pair
+    )
+    assert (pair_audit["total"], pair_audit["passed"], pair_audit["excluded"]) == (2, 1, 1)
+
+
+def test_gate_flag_dry_run_skips_all_mat_loading_and_defers_cap(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    first_required = S.check_coverage([])["required_pairs"][0]
+    pair = (first_required["bearing_id"], first_required["condition_code"])
+    _make_inventory(root, include_secondary=False, special_pair=pair)
+    out = tmp_path / "out"
+    calls = []
+
+    def forbidden_prevalidation(*args, **kwargs):
+        calls.append("prevalidation")
+        pytest.fail("dry-run must not open MAT files for gate prevalidation")
+
+    def forbidden_loader(*args, **kwargs):
+        calls.append("dataset_loader")
+        pytest.fail("dry-run must not open MAT files in the dataset loader")
+
+    monkeypatch.setattr(RUN.ds_mod, "load_pu_recording", forbidden_prevalidation)
+    monkeypatch.setattr(RUN.ds_mod, "load_real_paderborn_dataset", forbidden_loader)
+
+    code = RUN.main(
+        _run_args(
+            root,
+            out,
+            extra=(
+                "--exclude-gate-failures",
+                "--max-recordings-per-pair",
+                "1",
+                "--dry-run",
+            ),
+        )
+    )
+
+    assert code == 0
+    assert calls == []
+    manifest, rows, summary = _read_outputs(out)
+    assert manifest["status"] == "DRY_RUN"
+    assert manifest["loaded_file_count"] == 0
+    assert rows == []
+    gate = manifest["recording_gate_exclusion"]
+    assert gate["enabled"] is True
+    assert gate["prevalidation_performed"] is False
+    assert gate["prevalidation_status"] == "SKIPPED_DRY_RUN"
+    assert gate["prevalidation_skipped_reason"] == "dry_run"
+    assert gate["counts"] == {"total": 41, "passed": None, "excluded": 0}
+    assert manifest["selected_file_count"] == 41
+    assert manifest["memory_guard"]["recording_cap_applied"] is False
+    assert manifest["memory_guard"]["cap_deferred_until_after_gate_prevalidation"] is True
+    assert "gate_prevalidation_skipped: dry-run; no MAT files were opened" in summary
+    assert "recording cap not applied in dry-run" in summary
+    assert "timing_irregularity_cause: unknown" in summary

@@ -51,6 +51,30 @@ DEFAULT_SEEDS = (42, 1337, 2026, 7, 99)
 DEFAULT_REPRESENTATIONS = ("R1_Raw", "R3_Order")
 EVALUATION_VIEWS = ("test_in_condition", "test_primary", "test_secondary")
 FIXED_LABELS = (0, 1, 2)
+GATE_FAILURE_PREFIXES = {
+    "endpoint_rate_gate": "endpoint rate gate failed: ",
+    "timestamp_residual_gate": "timestamp residual gate failed: ",
+}
+# Owner-provided survey references are reported descriptively only; they are not
+# run-time inclusion thresholds or minimum-count requirements.
+_OWNER_SURVEY_REQUIRED_PAIR_PASS_REFERENCE = 7
+_OWNER_SURVEY_CONTEXT = {
+    "provenance": "owner-provided local, non-shared survey; not independently reproduced",
+    "total_files": 1020,
+    "passed_files": 599,
+    "failed_files": 421,
+    "first_failure_counts": {
+        "timestamp_residual_gate": 293,
+        "endpoint_rate_gate": 128,
+    },
+    "minimum_passed_per_bearing_condition_pair": 5,
+    "minimum_passed_per_required_pair": 7,
+    "class_pass_rate_percent": {
+        "Healthy": 57,
+        "Outer_Race": 60,
+        "Inner_Race": 58,
+    },
+}
 RESULT_COLUMNS = (
     "representation",
     "seed",
@@ -148,6 +172,15 @@ def _make_argparser() -> argparse.ArgumentParser:
                         help="Comma-separated seeds (default: 42,1337,2026,7,99)")
     parser.add_argument("--max-recordings-per-pair", type=_positive_int, default=None,
                         help="Optional positive cap per (physical bearing, condition) pair; default uses all")
+    parser.add_argument(
+        "--exclude-gate-failures",
+        action="store_true",
+        default=False,
+        help=(
+            "Opt in to excluding recordings whose first PuRecordingError is the "
+            "endpoint-rate or timestamp-residual reader gate; all other errors remain fatal"
+        ),
+    )
     parser.add_argument("--no-class-weights", action="store_true",
                         help="Disable training-partition inverse-frequency CrossEntropy weights")
     parser.add_argument("--dry-run", action="store_true",
@@ -229,7 +262,18 @@ def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 def _summary_text(manifest: Mapping[str, Any]) -> str:
     coverage = manifest.get("coverage") or {}
+    post_gate_coverage = manifest.get("coverage_after_gate_exclusion") or {}
     memory = manifest.get("memory_guard") or {}
+    gate_audit = manifest.get("recording_gate_exclusion") or {}
+    gate_counts = gate_audit.get("counts") or {}
+    gate_total = gate_counts.get("total", 0)
+    gate_passed = gate_counts.get("passed")
+    gate_excluded = gate_counts.get("excluded", 0)
+    gate_excluded_percent = (
+        100.0 * gate_excluded / gate_total
+        if gate_audit.get("prevalidation_performed") and gate_total
+        else None
+    )
     lines = [
         "Stage 1 training run summary",
         f"status: {manifest.get('status')}",
@@ -247,8 +291,21 @@ def _summary_text(manifest: Mapping[str, Any]) -> str:
         f"loaded_file_list_sha256: {manifest.get('loaded_file_list_sha256')}",
         f"selected_file_list_sha256: {manifest.get('selected_file_list_sha256')}",
         f"excluded_file_count: {manifest.get('excluded_file_count', 0)}",
+        f"gate_failure_exclusion_enabled: {gate_audit.get('enabled', False)}",
+        f"gate_prevalidation_status: {gate_audit.get('prevalidation_status', 'NOT_RECORDED')}",
+        "gate_prevalidation_counts: "
+        f"total={gate_total}; passed={gate_passed if gate_passed is not None else 'not checked'}; "
+        f"excluded={gate_excluded}"
+        + (
+            f" ({gate_excluded_percent:.2f}% of prevalidated files)"
+            if gate_excluded_percent is not None
+            else ""
+        ),
+        "timing_irregularity_cause: unknown (the timestamp-residual gate does not diagnose its cause).",
         f"required_coverage_gaps: {len(coverage.get('missing_required', []))}",
+        f"post_gate_required_coverage_gaps: {len(post_gate_coverage.get('missing_required', []))}",
         f"secondary_condition_gaps: {len(coverage.get('secondary_condition_gaps', []))}",
+        f"post_gate_secondary_condition_gaps: {len(post_gate_coverage.get('secondary_condition_gaps', []))}",
         f"completed_result_rows: {len(manifest.get('completed_runs', []))}",
         f"failed_combinations: {len(manifest.get('failed_runs', []))}",
         f"skipped_combinations: {len(manifest.get('skipped_runs', []))}",
@@ -256,11 +313,93 @@ def _summary_text(manifest: Mapping[str, Any]) -> str:
         "Uncertainty intervals are descriptive cluster-bootstrap intervals on physical_bearing_uids.",
         "Filename coverage does not verify MAT signal content, channels, sampling rate, length, or windows.",
     ]
+    if gate_audit.get("prevalidation_skipped_reason"):
+        skip_reason = gate_audit["prevalidation_skipped_reason"]
+        if skip_reason == "dry_run":
+            lines.append(
+                "gate_prevalidation_skipped: dry-run; no MAT files were opened for prevalidation"
+            )
+        elif skip_reason == "flag_disabled":
+            lines.append("gate_prevalidation_skipped: --exclude-gate-failures was not enabled")
+        else:
+            lines.append(f"gate_prevalidation_skipped: {skip_reason}")
+    if gate_audit.get("prevalidation_performed"):
+        lines.extend(
+            [
+                "gate exclusions by first-failure reason: "
+                + ", ".join(
+                    f"{name}={count}"
+                    for name, count in gate_audit.get("exclusions_by_reason", {}).items()
+                ),
+                "Gate failures are first reader failures only, not an exhaustive defect inventory.",
+                "Owner survey context is local and owner-provided; it was not independently reproduced.",
+                "Owner-provided survey reference (not independently reproduced): "
+                "599/1020 passed; 421 first gate failures (293 timestamp-residual, "
+                "128 endpoint-rate); pair minimum 5, required-pair minimum 7; "
+                "class pass rates Healthy 57%, Outer 60%, Inner 58%.",
+            ]
+        )
+        attrition = gate_audit.get("attrition") or {}
+        for dimension, title in (
+            ("by_partition", "partition"),
+            ("by_condition", "condition"),
+            ("by_physical_bearing", "physical bearing"),
+            ("by_class", "class"),
+        ):
+            groups = attrition.get(dimension) or {}
+            if not groups:
+                continue
+            lines.extend(["", f"gate attrition by {title} (passed and excluded / denominator):"])
+            for group_name, row in groups.items():
+                passed_percent = row.get("passed_percent")
+                excluded_percent = row.get("excluded_percent")
+                passed_pct_text = (
+                    "n/a" if passed_percent is None else f"{passed_percent:.2f}%"
+                )
+                excluded_pct_text = (
+                    "n/a" if excluded_percent is None else f"{excluded_percent:.2f}%"
+                )
+                denominator = row.get("denominator", row.get("total", 0))
+                lines.append(
+                    f"- {group_name}: passed={row.get('passed')}/{denominator} "
+                    f"({passed_pct_text}); excluded={row.get('excluded')}/{denominator} "
+                    f"({excluded_pct_text})"
+                )
+        adequacy = gate_audit.get("required_pair_sample_adequacy") or {}
+        if adequacy:
+            newly_below = adequacy.get("newly_below_reference_due_to_gate_exclusion", [])
+            below_after = adequacy.get("below_reference_after_gate_filter", [])
+            before = adequacy.get("below_reference_before_gate_filter", [])
+            reference = adequacy.get(
+                "owner_survey_reference_minimum_passed_per_required_pair"
+            )
+            lines.extend(
+                [
+                    "",
+                    "required-pair adequacy comparison (descriptive only; not a run threshold): "
+                    f"{len(below_after)} pair(s) below the owner-survey reference of "
+                    f"{reference} retained passes; {len(newly_below)} newly below after "
+                    f"gate exclusion and {len(before)} already below before filtering",
+                ]
+            )
+            lines.extend(
+                f"- {row['bearing_id']} @ {row['condition_code']}: "
+                f"{row['passed']}/{row['total']} retained; "
+                f"{'newly below' if row['total'] >= reference else 'below before filtering'} "
+                f"reference {reference}"
+                for row in below_after
+            )
+    if gate_audit.get("interpretation_note"):
+        lines.extend(["", f"gate-filter interpretation: {gate_audit['interpretation_note']}"])
     if coverage.get("secondary_condition_gaps"):
         lines.extend(["", "non-fatal secondary-condition coverage gaps:"])
         lines.extend(
             f"- {gap.get('bearing_id')} @ {gap.get('condition_code')}"
             for gap in coverage["secondary_condition_gaps"]
+        )
+    if memory and memory.get("cap_deferred_until_after_gate_prevalidation"):
+        lines.append(
+            "recording cap not applied in dry-run; deferred until gate prevalidation can run"
         )
     if memory:
         lines.extend(
@@ -454,6 +593,404 @@ def select_approved_recordings(
         "groups": selection_groups,
     }
     return selected, excluded, selection
+
+
+def _classify_approved_gate_failure(exc: BaseException) -> str | None:
+    """Return a gate name only for the two exact reader-message prefixes.
+
+    The committed reader exposes no structured gate identifier. Its two gate
+    raise sites have distinct literal prefixes; matching only at the beginning
+    is deliberately fail-closed, so any changed or unrelated error propagates.
+    """
+    message = str(exc)
+    for gate_name, prefix in GATE_FAILURE_PREFIXES.items():
+        if message.startswith(prefix):
+            return gate_name
+    return None
+
+
+def _empty_gate_audit(
+    *,
+    enabled: bool,
+    skipped_reason: str | None,
+    total: int = 0,
+) -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "prevalidation_performed": False,
+        "prevalidation_status": "NOT_RUN",
+        "prevalidation_skipped_reason": skipped_reason,
+        "speed_unit": "rpm_assumed",
+        "reader_thresholds": "load_pu_recording defaults; no threshold overrides",
+        "counts": {"total": int(total), "passed": None, "excluded": 0},
+        "counts_scope": "No gate outcomes were measured; passed is null, not assumed.",
+        "exclusions_by_reason": {
+            gate_name: 0 for gate_name in GATE_FAILURE_PREFIXES
+        },
+        "exclusions_by_class": {},
+        "exclusions_by_role": {},
+        "exclusions_by_condition": {},
+        "exclusions_by_physical_bearing": {},
+        "exclusion_list": [],
+        "attrition": None,
+        "post_exclusion_per_pair_counts": None,
+        "post_exclusion_coverage": None,
+        "required_pair_sample_adequacy": None,
+        "owner_provided_survey_context": dict(_OWNER_SURVEY_CONTEXT),
+        "timing_irregularity_cause": (
+            "unknown; the timestamp-residual gate does not diagnose the underlying cause"
+        ),
+        "interpretation_note": (
+            "When enabled and completed, results are conditional on the gate-passing subset; "
+            "they do not establish representativeness of all published recordings or absence "
+            "of selection bias. A first gate failure is not an exhaustive defect inventory."
+        ),
+    }
+
+
+def _recording_role_map(split: Mapping[str, Any]) -> dict[tuple[str, str], str]:
+    """Map each approved bearing-condition pair to its Stage 1 partition role."""
+    roles: dict[tuple[str, str], str] = {}
+    for view in ("train", "validation", *EVALUATION_VIEWS):
+        allocation_name = view if view in ("train", "validation") else "test"
+        condition_code = split["conditions"][view]
+        for bearing_id in split["allocations"][allocation_name]:
+            pair = (bearing_id, condition_code)
+            if pair in roles:
+                raise Stage1RunError(
+                    f"approved split maps bearing-condition pair {pair!r} to multiple roles"
+                )
+            roles[pair] = view
+    return roles
+
+
+def _prevalidate_approved_recordings(
+    paths: Sequence[Path],
+    data_root: Path,
+    split: Mapping[str, Any],
+    class_map: Mapping[str, Mapping[str, Any]],
+    *,
+    progress: dict[str, Any],
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    """Prevalidate every approved pair candidate before any per-pair cap.
+
+    Only the two reader gate prefixes are recorded as exclusions. All other
+    ``PuRecordingError`` instances and every other exception remain fatal.
+    ``progress`` is mutated as each file completes so a fatal later error does
+    not erase already observed, auditable first-failure exclusions.
+    """
+    role_by_pair = _recording_role_map(split)
+    passing_paths = progress.setdefault("passing_paths", [])
+    exclusion_list = progress.setdefault("exclusion_list", [])
+    processed_paths = progress.setdefault("processed_paths", [])
+    progress.setdefault("fatal_path", None)
+    progress.setdefault("fatal_error", None)
+
+    for path in paths:
+        relative_path = path.relative_to(data_root).as_posix()
+        try:
+            ds_mod.load_pu_recording(os.fspath(path), speed_unit="rpm_assumed")
+        except ds_mod.PuRecordingError as exc:
+            gate_name = _classify_approved_gate_failure(exc)
+            if gate_name is None:
+                progress["fatal_path"] = relative_path
+                progress["fatal_error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                raise
+            bearing_id, condition_code, recording_id = (
+                ds_mod._parse_paderborn_recording_filename(path)
+            )
+            pair = (bearing_id, condition_code)
+            role = role_by_pair.get(pair)
+            class_row = class_map.get(bearing_id)
+            if role is None or class_row is None:
+                raise Stage1RunError(
+                    "approved recording identity is missing its split role or class map: "
+                    f"{relative_path} ({bearing_id}, {condition_code})"
+                )
+            exclusion_list.append(
+                {
+                    "path": relative_path,
+                    "bearing_id": bearing_id,
+                    "physical_bearing_uid": bearing_id,
+                    "condition_code": condition_code,
+                    "recording_id": recording_id,
+                    "role": role,
+                    "class_name": str(class_row["class_name"]),
+                    "label": int(class_row["label"]),
+                    "gate_name": gate_name,
+                    "reason": gate_name,
+                    "error_message": str(exc),
+                    "first_failure_only": True,
+                }
+            )
+        except Exception as exc:
+            progress["fatal_path"] = relative_path
+            progress["fatal_error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            raise
+        else:
+            passing_paths.append(path)
+
+        processed_paths.append(path)
+
+    return list(passing_paths), list(exclusion_list)
+
+
+def _count_row(total: int, passed: int) -> dict[str, Any]:
+    excluded = total - passed
+    return {
+        "denominator": int(total),
+        "total": int(total),
+        "passed": int(passed),
+        "excluded": int(excluded),
+        "passed_percent": round(100.0 * passed / total, 2) if total else None,
+        "excluded_percent": round(100.0 * excluded / total, 2) if total else None,
+    }
+
+
+def _build_gate_attrition(
+    candidate_paths: Sequence[Path],
+    passing_paths: Sequence[Path],
+    data_root: Path,
+    split: Mapping[str, Any],
+    class_map: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize complete-case attrition over all approved candidates pre-cap."""
+    role_by_pair = _recording_role_map(split)
+    role_names = ("train", "validation", *EVALUATION_VIEWS)
+    condition_names = sorted(set(split["conditions"].values()))
+    bearing_names = sorted(
+        {
+            bearing_id
+            for allocation_name in ("train", "validation", "test")
+            for bearing_id in split["allocations"][allocation_name]
+        }
+    )
+    class_rows = {
+        str(class_map[bearing_id]["class_name"]): {
+            "label": int(class_map[bearing_id]["label"])
+        }
+        for bearing_id in bearing_names
+    }
+
+    def blank_counts() -> dict[str, int]:
+        return {"total": 0, "passed": 0}
+
+    by_role = {name: blank_counts() for name in role_names}
+    by_condition = {name: blank_counts() for name in condition_names}
+    by_bearing = {name: blank_counts() for name in bearing_names}
+    by_class = {name: blank_counts() for name in sorted(class_rows)}
+    passing_relatives = {
+        path.relative_to(data_root).as_posix() for path in passing_paths
+    }
+
+    for path in candidate_paths:
+        relative_path = path.relative_to(data_root).as_posix()
+        bearing_id, condition_code, _recording_id = (
+            ds_mod._parse_paderborn_recording_filename(path)
+        )
+        role = role_by_pair.get((bearing_id, condition_code))
+        class_row = class_map.get(bearing_id)
+        if role is None or class_row is None:
+            raise Stage1RunError(
+                f"gate attrition candidate has no approved role/class: {relative_path}"
+            )
+        class_name = str(class_row["class_name"])
+        is_passed = relative_path in passing_relatives
+        for group in (
+            by_role[role],
+            by_condition[condition_code],
+            by_bearing[bearing_id],
+            by_class[class_name],
+        ):
+            group["total"] += 1
+            group["passed"] += int(is_passed)
+
+    return {
+        "scope": (
+            "All approved Stage 1 bearing-condition recording candidates before the "
+            "deterministic per-pair cap."
+        ),
+        "by_partition": {
+            name: _count_row(counts["total"], counts["passed"])
+            for name, counts in by_role.items()
+        },
+        "by_condition": {
+            name: _count_row(counts["total"], counts["passed"])
+            for name, counts in by_condition.items()
+        },
+        "by_physical_bearing": {
+            name: {
+                "class_name": str(class_map[name]["class_name"]),
+                "label": int(class_map[name]["label"]),
+                **_count_row(counts["total"], counts["passed"]),
+            }
+            for name, counts in by_bearing.items()
+        },
+        "by_class": {
+            name: {
+                **class_rows[name],
+                **_count_row(counts["total"], counts["passed"]),
+            }
+            for name, counts in by_class.items()
+        },
+    }
+
+
+def _build_post_exclusion_pair_counts(
+    coverage_before: Mapping[str, Any],
+    coverage_after: Mapping[str, Any],
+    split: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    role_by_pair = _recording_role_map(split)
+    required_pairs = required_bearing_condition_pairs(split)
+    optional_pairs = optional_secondary_bearing_condition_pairs(split)
+    all_pairs = required_pairs | optional_pairs
+    before_counts = coverage_before["recording_counts"]
+    after_counts = coverage_after["recording_counts"]
+    rows: list[dict[str, Any]] = []
+    for bearing_id, condition_code in sorted(all_pairs):
+        total = int(before_counts[bearing_id][condition_code])
+        passed = int(after_counts[bearing_id][condition_code])
+        rows.append(
+            {
+                "bearing_id": bearing_id,
+                "physical_bearing_uid": bearing_id,
+                "condition_code": condition_code,
+                "partition": role_by_pair[(bearing_id, condition_code)],
+                "coverage_requirement": (
+                    "required"
+                    if (bearing_id, condition_code) in required_pairs
+                    else "optional_secondary"
+                ),
+                **_count_row(total, passed),
+            }
+        )
+    return rows
+
+
+def _required_pair_sample_adequacy(
+    pair_counts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    required = [
+        dict(row) for row in pair_counts
+        if row["coverage_requirement"] == "required"
+    ]
+    reference = _OWNER_SURVEY_REQUIRED_PAIR_PASS_REFERENCE
+    below_before = [row for row in required if row["total"] < reference]
+    below_after = [row for row in required if row["passed"] < reference]
+    newly_below = [
+        row for row in required
+        if row["total"] >= reference and row["passed"] < reference
+    ]
+    reduced = [row for row in required if row["excluded"] > 0]
+    return {
+        "owner_survey_reference_minimum_passed_per_required_pair": reference,
+        "reference_is_descriptive_only_not_an_abort_or_inclusion_threshold": True,
+        "below_reference_before_gate_filter": below_before,
+        "below_reference_after_gate_filter": below_after,
+        "newly_below_reference_due_to_gate_exclusion": newly_below,
+        "required_pairs_with_any_gate_attrition": reduced,
+    }
+
+
+def _build_gate_audit(
+    candidate_paths: Sequence[Path],
+    passing_paths: Sequence[Path],
+    exclusion_list: Sequence[Mapping[str, Any]],
+    data_root: Path,
+    split: Mapping[str, Any],
+    class_map: Mapping[str, Mapping[str, Any]],
+    *,
+    coverage_before: Mapping[str, Any] | None,
+    coverage_after: Mapping[str, Any] | None,
+    completed: bool,
+    planned_candidate_count: int | None = None,
+) -> dict[str, Any]:
+    candidate_paths = list(candidate_paths)
+    passing_paths = list(passing_paths)
+    exclusions = [dict(entry) for entry in exclusion_list]
+    audit = _empty_gate_audit(
+        enabled=True,
+        skipped_reason=None,
+        total=len(candidate_paths),
+    )
+    audit.update(
+        {
+            "prevalidation_performed": True,
+            "prevalidation_status": "COMPLETE" if completed else "ABORTED_FATAL_ERROR",
+            "prevalidation_skipped_reason": None,
+            "counts": {
+                "total": len(candidate_paths),
+                "passed": len(passing_paths),
+                "excluded": len(exclusions),
+            },
+            "counts_scope": (
+                "All approved pair candidates before the recording cap."
+                if completed
+                else "Files fully processed before the fatal error; unprocessed candidates are not counted."
+            ),
+            "exclusion_list": exclusions,
+            "attrition": _build_gate_attrition(
+                candidate_paths, passing_paths, data_root, split, class_map
+            ),
+        }
+    )
+    if planned_candidate_count is not None:
+        audit["candidate_count"] = int(planned_candidate_count)
+        audit["unprocessed_candidate_count"] = max(
+            0, int(planned_candidate_count) - len(candidate_paths)
+        )
+
+    role_names = ("train", "validation", *EVALUATION_VIEWS)
+    condition_names = sorted(set(split["conditions"].values()))
+    bearing_names = sorted(
+        {
+            bearing_id
+            for allocation_name in ("train", "validation", "test")
+            for bearing_id in split["allocations"][allocation_name]
+        }
+    )
+    class_names = sorted(
+        {
+            str(class_map[bearing_id]["class_name"])
+            for bearing_id in bearing_names
+        }
+    )
+    by_reason = {name: 0 for name in GATE_FAILURE_PREFIXES}
+    by_class = {name: 0 for name in class_names}
+    by_role = {name: 0 for name in role_names}
+    by_condition = {name: 0 for name in condition_names}
+    by_bearing = {name: 0 for name in bearing_names}
+    for entry in exclusions:
+        by_reason[entry["gate_name"]] += 1
+        by_class[entry["class_name"]] += 1
+        by_role[entry["role"]] += 1
+        by_condition[entry["condition_code"]] += 1
+        by_bearing[entry["bearing_id"]] += 1
+    audit["exclusions_by_reason"] = by_reason
+    audit["exclusions_by_class"] = by_class
+    audit["exclusions_by_role"] = by_role
+    audit["exclusions_by_condition"] = by_condition
+    audit["exclusions_by_physical_bearing"] = by_bearing
+
+    if completed:
+        if coverage_before is None or coverage_after is None:
+            raise Stage1RunError("completed gate audit requires before/after coverage")
+        pair_counts = _build_post_exclusion_pair_counts(
+            coverage_before, coverage_after, split
+        )
+        audit["post_exclusion_per_pair_counts"] = pair_counts
+        audit["post_exclusion_coverage"] = dict(coverage_after)
+        audit["required_pair_sample_adequacy"] = _required_pair_sample_adequacy(
+            pair_counts
+        )
+    return audit
 
 
 def normalize_partitions(
@@ -762,8 +1299,13 @@ def _new_manifest(args: argparse.Namespace, run_id: str, paths: Mapping[str, Pat
         "excluded_file_count": 0,
         "excluded_recordings": [],
         "recording_exclusion_log": [],
+        "recording_gate_exclusion": _empty_gate_audit(
+            enabled=getattr(args, "exclude_gate_failures", False),
+            skipped_reason="not_reached",
+        ),
         "coverage": None,
         "coverage_preflight": None,
+        "coverage_after_gate_exclusion": None,
         "memory_guard": None,
         "partition_counts": None,
         "planned_runs": [],
@@ -800,6 +1342,11 @@ def run_stage1(args: argparse.Namespace) -> int:
     manifest = _new_manifest(args, run_id, output_paths)
     phase = "INITIAL_PREFLIGHT"
     secondary_inventory_present = False
+    gate_candidate_paths: list[Path] = []
+    gate_prevalidation_progress: dict[str, Any] | None = None
+    gate_class_map: Mapping[str, Mapping[str, Any]] | None = None
+    gate_coverage_before: Mapping[str, Any] | None = None
+    split: Mapping[str, Any] | None = None
 
     def persist() -> None:
         _persist_run_files(
@@ -847,20 +1394,185 @@ def run_stage1(args: argparse.Namespace) -> int:
         phase = "MEMORY_GUARD"
         manifest["current_phase"] = phase
         persist()
-        selected_paths, excluded, selection = select_approved_recordings(
-            all_paths,
-            args.data_root,
-            split,
-            max_recordings_per_pair=args.max_recordings_per_pair,
-        )
-        selected_relative = [path.relative_to(args.data_root).as_posix() for path in selected_paths]
+        gate_enabled = bool(getattr(args, "exclude_gate_failures", False))
+        gate_exclusions: list[dict[str, Any]] = []
+
+        if gate_enabled and not args.dry_run:
+            # First retain every approved bearing-condition candidate. The
+            # recording cap is intentionally deferred until after exclusion.
+            gate_candidate_paths, outside_excluded, candidate_selection = (
+                select_approved_recordings(
+                    all_paths,
+                    args.data_root,
+                    split,
+                    max_recordings_per_pair=None,
+                )
+            )
+            manifest["excluded_recordings"] = list(outside_excluded)
+            manifest["excluded_file_count"] = len(outside_excluded)
+            gate_coverage_before = coverage
+            gate_class_map = ds_mod._load_paderborn_class_map()
+            phase = "RECORDING_GATE_PREFLIGHT"
+            manifest["current_phase"] = phase
+            in_progress_audit = _empty_gate_audit(
+                enabled=True,
+                skipped_reason=None,
+                total=len(gate_candidate_paths),
+            )
+            in_progress_audit.update(
+                {
+                    "prevalidation_performed": True,
+                    "prevalidation_status": "RUNNING",
+                    "prevalidation_skipped_reason": None,
+                    "counts": {
+                        "total": len(gate_candidate_paths),
+                        "passed": 0,
+                        "excluded": 0,
+                    },
+                    "counts_scope": "All approved pair candidates before the recording cap.",
+                }
+            )
+            manifest["recording_gate_exclusion"] = in_progress_audit
+            persist()
+
+            gate_prevalidation_progress = {}
+            passing_paths, gate_exclusions = _prevalidate_approved_recordings(
+                gate_candidate_paths,
+                args.data_root,
+                split,
+                gate_class_map,
+                progress=gate_prevalidation_progress,
+            )
+            try:
+                coverage_after_gate = split_mod.check_coverage(
+                    passing_paths, strict=False
+                )
+            except Exception as coverage_exc:
+                raise Stage1RunError(
+                    "post-gate-exclusion filename coverage check failed: "
+                    f"{coverage_exc}"
+                ) from coverage_exc
+
+            gate_audit = _build_gate_audit(
+                gate_candidate_paths,
+                passing_paths,
+                gate_exclusions,
+                args.data_root,
+                split,
+                gate_class_map,
+                coverage_before=gate_coverage_before,
+                coverage_after=coverage_after_gate,
+                completed=True,
+            )
+            gate_audit["candidate_count"] = len(gate_candidate_paths)
+            manifest["recording_gate_exclusion"] = gate_audit
+            manifest["coverage_after_gate_exclusion"] = coverage_after_gate
+            manifest["secondary_condition_gaps"] = coverage_after_gate[
+                "secondary_condition_gaps"
+            ]
+            manifest["excluded_recordings"] = [
+                *outside_excluded,
+                *gate_exclusions,
+            ]
+            manifest["excluded_file_count"] = len(manifest["excluded_recordings"])
+            candidate_selection.update(
+                {
+                    "requested_max_recordings_per_pair": args.max_recordings_per_pair,
+                    "recording_cap_applied": False,
+                    "excluded_by_gate_failure_count": len(gate_exclusions),
+                    "approved_pair_candidate_count_before_gate": len(gate_candidate_paths),
+                    "gate_passing_candidate_count": len(passing_paths),
+                }
+            )
+            manifest["memory_guard"] = candidate_selection
+            persist()
+
+            if coverage_after_gate["missing_required"]:
+                raise Stage1RunError(
+                    "required Stage 1 coverage is incomplete after gate exclusions: "
+                    f"{len(coverage_after_gate['missing_required'])} required "
+                    "bearing-condition pairs have zero passing recordings"
+                )
+
+            phase = "MEMORY_GUARD"
+            manifest["current_phase"] = phase
+            persist()
+            selected_paths, cap_excluded, selection = select_approved_recordings(
+                passing_paths,
+                args.data_root,
+                split,
+                max_recordings_per_pair=args.max_recordings_per_pair,
+            )
+            selection["excluded_outside_approved_pairs_count"] = len(outside_excluded)
+            selection["excluded_by_gate_failure_count"] = len(gate_exclusions)
+            selection["approved_pair_candidate_count_before_gate"] = len(
+                gate_candidate_paths
+            )
+            selection["gate_passing_candidate_count"] = len(passing_paths)
+            excluded = [*outside_excluded, *gate_exclusions, *cap_excluded]
+        elif gate_enabled and args.dry_run:
+            # No MAT may be opened in dry-run, so validation and the subsequent
+            # cap are both deferred rather than pretending unvalidated files passed.
+            selected_paths, excluded, selection = select_approved_recordings(
+                all_paths,
+                args.data_root,
+                split,
+                max_recordings_per_pair=None,
+            )
+            selection["requested_max_recordings_per_pair"] = args.max_recordings_per_pair
+            selection["recording_cap_applied"] = False
+            selection["cap_deferred_until_after_gate_prevalidation"] = True
+            audit = _empty_gate_audit(
+                enabled=True,
+                skipped_reason="dry_run",
+                total=selection["approved_pair_candidate_count"],
+            )
+            audit["prevalidation_status"] = "SKIPPED_DRY_RUN"
+            audit["counts_scope"] = (
+                "Approved pair candidates before the requested cap; no gate outcomes "
+                "are known because dry-run opens no MAT files."
+            )
+            manifest["recording_gate_exclusion"] = audit
+        else:
+            # Preserve the existing flag-off behavior: cap and pass the selected
+            # files to the dataset loader without a separate reader preflight.
+            selected_paths, excluded, selection = select_approved_recordings(
+                all_paths,
+                args.data_root,
+                split,
+                max_recordings_per_pair=args.max_recordings_per_pair,
+            )
+            audit = _empty_gate_audit(
+                enabled=False,
+                skipped_reason="flag_disabled",
+                total=selection["approved_pair_candidate_count"],
+            )
+            audit["counts_scope"] = (
+                "Approved pair candidates; no separate gate prevalidation was run, "
+                "so passed is null rather than assumed."
+            )
+            manifest["recording_gate_exclusion"] = audit
+
+        selected_relative = [
+            path.relative_to(args.data_root).as_posix() for path in selected_paths
+        ]
         manifest["memory_guard"] = selection
         manifest["selected_file_count"] = len(selected_relative)
         manifest["selected_file_list"] = selected_relative
         manifest["selected_file_list_sha256"] = _sha256_file_list(selected_relative)
-        manifest["excluded_recordings"] = excluded
-        manifest["excluded_file_count"] = len(excluded)
-        manifest["secondary_condition_gaps"] = coverage["secondary_condition_gaps"]
+        if not (gate_enabled and not args.dry_run):
+            manifest["excluded_recordings"] = excluded
+            manifest["excluded_file_count"] = len(excluded)
+            manifest["secondary_condition_gaps"] = coverage["secondary_condition_gaps"]
+        else:
+            # Include post-gate per-pair cap exclusions after recording-gate rows.
+            manifest["excluded_recordings"].extend(
+                entry for entry in excluded if entry not in manifest["excluded_recordings"]
+            )
+            manifest["excluded_file_count"] = len(manifest["excluded_recordings"])
+            selection["recording_cap_applied"] = args.max_recordings_per_pair is not None
+            selection["cap_deferred_until_after_gate_prevalidation"] = False
+            manifest["memory_guard"] = selection
 
         if not selected_paths:
             raise Stage1RunError("memory guard selected no recordings for the approved Stage 1 pairs")
@@ -1146,7 +1858,46 @@ def run_stage1(args: argparse.Namespace) -> int:
         return 1 if manifest["failed_runs"] else 0
 
     except Exception as exc:
-        if phase in ("INITIAL_PREFLIGHT", "COVERAGE_PREFLIGHT", "MEMORY_GUARD"):
+        if (
+            phase == "RECORDING_GATE_PREFLIGHT"
+            and gate_prevalidation_progress is not None
+            and gate_class_map is not None
+            and (manifest.get("recording_gate_exclusion") or {}).get(
+                "prevalidation_status"
+            ) == "RUNNING"
+        ):
+            processed_paths = gate_prevalidation_progress.get("processed_paths", [])
+            partial_exclusions = gate_prevalidation_progress.get("exclusion_list", [])
+            partial_audit = _build_gate_audit(
+                processed_paths,
+                gate_prevalidation_progress.get("passing_paths", []),
+                partial_exclusions,
+                args.data_root,
+                split,
+                gate_class_map,
+                coverage_before=gate_coverage_before,
+                coverage_after=None,
+                completed=False,
+                planned_candidate_count=len(gate_candidate_paths),
+            )
+            partial_audit["fatal_path"] = gate_prevalidation_progress.get("fatal_path")
+            partial_audit["fatal_error"] = gate_prevalidation_progress.get("fatal_error") or {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            manifest["recording_gate_exclusion"] = partial_audit
+            manifest["excluded_recordings"] = [
+                *manifest.get("excluded_recordings", []),
+                *partial_exclusions,
+            ]
+            manifest["excluded_file_count"] = len(manifest["excluded_recordings"])
+
+        if phase in (
+            "INITIAL_PREFLIGHT",
+            "COVERAGE_PREFLIGHT",
+            "MEMORY_GUARD",
+            "RECORDING_GATE_PREFLIGHT",
+        ):
             manifest["status"] = "FAILED_PREFLIGHT"
         elif phase == "MAT_LOADING_AND_FEATURE_EXTRACTION":
             manifest["status"] = "FAILED_LOADING"
