@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "allocations": {
+    "train": [
+      "K002", "K004", "K006",
+      "KA01", "KA05", "KA07", "KA04", "KA15",
+      "KI01", "KI07", "KI04", "KI14", "KI18"
+    ],
+    "validation": [
+      "K005",
+      "KA09", "KA16",
+      "KI03", "KI17"
+    ],
+    "test": [
+      "K001", "K003",
+      "KA03", "KA06", "KA08", "KA22", "KA30",
+      "KI05", "KI08", "KI16", "KI21"
+    ],
+    "excluded": ["KB23", "KB24", "KB27"]
+  },
+  "conditions": {
+    "train": "N15_M07_F10",
+    "validation": "N15_M07_F10",
+    "test_in_condition": "N15_M07_F10",
+    "test_primary": "N09_M07_F10",
+    "test_secondary": "N15_M07_F04"
+  }
+}

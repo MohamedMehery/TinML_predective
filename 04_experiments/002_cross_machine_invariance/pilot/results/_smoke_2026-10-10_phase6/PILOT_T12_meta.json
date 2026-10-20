@@ -1,0 +1,16 @@
+{
+  "n_source_folds": 1,
+  "n_seeds": 1,
+  "n_target_uids": 13,
+  "source_dataset": "CWRU",
+  "target_dataset": "PU",
+  "representations": [
+    "R1_Raw",
+    "R3_Order"
+  ],
+  "seeds": [
+    42
+  ],
+  "bootstrap_n": 200,
+  "ci": 0.95
+}

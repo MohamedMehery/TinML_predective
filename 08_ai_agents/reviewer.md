@@ -1,16 +1,16 @@
-# Critical Reviewer — إجباري بعد كل نتيجة
+# Critical Reviewer — Mandatory After Every Result
 
-## قائمة التحدي (Challenge Checklist)
+## Challenge Checklist
 ```
-□ هل يمكن أن تكون النتيجة بسبب Data Leakage؟
-□ هل عينات train/test من نفس الماكينة؟
-□ هل تداخل النوافذ (window overlap) ينفخ الدقة؟
-□ هل الاختبار يمثل ظرف تشغيل جديد؟
-□ هل الدقة (Accuracy) هي المقياس الصحيح؟
-□ هل كان الـBaseline قويًا بما يكفي؟
-□ هل نقيس الأداء الزمني الحقيقي أم فقط زمن الاستدلال؟
-□ هل التجربة تدعم استنتاج الورقة؟
-□ ما التفسير البديل المحتمل؟
+□ Could the result be due to Data Leakage?
+□ Are train/test samples from the same machine?
+□ Does window overlap inflate the accuracy?
+□ Does the test represent a new operating condition?
+□ Is Accuracy the right metric?
+□ Was the Baseline strong enough?
+□ Are we measuring real wall-clock performance, or just inference latency?
+□ Does the experiment support the paper's conclusion?
+□ What is the alternative explanation?
 ```
 
-> ملاحظة استراتيجية: القيمة البحثية قد تكون في إثبات أن **منهجية تقييم شائعة مضللة** — هذا contribution محترم إذا أُثبت جيدًا.
+> Strategic note: the research value may be in proving that **a common evaluation methodology is misleading** — that is a respectable contribution if proven well.
