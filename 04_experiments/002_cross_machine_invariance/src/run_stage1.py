@@ -51,6 +51,9 @@ DEFAULT_SEEDS = (42, 1337, 2026, 7, 99)
 DEFAULT_REPRESENTATIONS = ("R1_Raw", "R3_Order")
 EVALUATION_VIEWS = ("test_in_condition", "test_primary", "test_secondary")
 FIXED_LABELS = (0, 1, 2)
+UNIFORM_RANDOM_BASELINE_DRAWS = 10_000
+UNIFORM_RANDOM_BASELINE_SEED = 20261021
+UNIFORM_RANDOM_BASELINE_CHUNK_SIZE = 256
 GATE_FAILURE_PREFIXES = {
     "endpoint_rate_gate": "endpoint rate gate failed: ",
     "timestamp_residual_gate": "timestamp residual gate failed: ",
@@ -90,6 +93,28 @@ RESULT_COLUMNS = (
     "ci_hi",
     "class_weights_used",
     "timestamp",
+    "confusion_matrix_labels",
+    "confusion_matrix",
+    "predicted_class_histogram",
+    "majority_class_baseline_class",
+    "majority_class_baseline_macro_f1",
+    "uniform_random_baseline_macro_f1_mc",
+    "uniform_random_baseline_draws",
+    "uniform_random_baseline_seed",
+    "train_macro_f1",
+    "validation_macro_f1",
+    "prediction_file",
+    "prediction_row_count",
+)
+PREDICTION_COLUMNS = (
+    "representation",
+    "seed",
+    "view",
+    "y_true",
+    "y_pred",
+    "physical_bearing_uid",
+    "condition",
+    "recording_id",
 )
 
 
@@ -265,6 +290,7 @@ def _summary_text(manifest: Mapping[str, Any]) -> str:
     post_gate_coverage = manifest.get("coverage_after_gate_exclusion") or {}
     memory = manifest.get("memory_guard") or {}
     gate_audit = manifest.get("recording_gate_exclusion") or {}
+    diagnostic_spec = manifest.get("evaluation_diagnostics") or {}
     gate_counts = gate_audit.get("counts") or {}
     gate_total = gate_counts.get("total", 0)
     gate_passed = gate_counts.get("passed")
@@ -290,6 +316,8 @@ def _summary_text(manifest: Mapping[str, Any]) -> str:
         f"loaded_file_count: {manifest.get('loaded_file_count', 0)}",
         f"loaded_file_list_sha256: {manifest.get('loaded_file_list_sha256')}",
         f"selected_file_list_sha256: {manifest.get('selected_file_list_sha256')}",
+        f"per_window_predictions_file: {manifest.get('output_files', {}).get('predictions_csv')}",
+        f"per_window_prediction_row_count: {manifest.get('per_window_prediction_row_count', 0)}",
         f"excluded_file_count: {manifest.get('excluded_file_count', 0)}",
         f"gate_failure_exclusion_enabled: {gate_audit.get('enabled', False)}",
         f"gate_prevalidation_status: {gate_audit.get('prevalidation_status', 'NOT_RECORDED')}",
@@ -313,6 +341,18 @@ def _summary_text(manifest: Mapping[str, Any]) -> str:
         "Uncertainty intervals are descriptive cluster-bootstrap intervals on physical_bearing_uids.",
         "Filename coverage does not verify MAT signal content, channels, sampling rate, length, or windows.",
     ]
+    if diagnostic_spec:
+        uniform_spec = diagnostic_spec.get("uniform_random_baseline", {})
+        lines.extend(
+            [
+                "",
+                "Evaluation diagnostics use fixed labels [0,1,2] and zero_division=0; "
+                "confusion-matrix rows are true labels and columns are predicted labels.",
+                "Uniform-random baseline is a Monte Carlo mean (not an exact theoretical value): "
+                f"{uniform_spec.get('draws_per_view')} draws/view, fixed seed "
+                f"{uniform_spec.get('fixed_seed')}, predictions uniform over [0,1,2].",
+            ]
+        )
     if gate_audit.get("prevalidation_skipped_reason"):
         skip_reason = gate_audit["prevalidation_skipped_reason"]
         if skip_reason == "dry_run":
@@ -428,13 +468,33 @@ def _summary_text(manifest: Mapping[str, Any]) -> str:
             for entry in manifest["recording_exclusion_log"]
         )
     if manifest.get("completed_runs"):
-        lines.extend(["", "completed evaluation rows (pooled-window F1; descriptive cluster-bootstrap CI):"])
         lines.extend(
-            "- {representation} seed={seed} view={view}: Macro-F1={macro_f1:.4f}; "
-            "F1[0,1,2]=[{f1_healthy:.4f}, {f1_outer:.4f}, {f1_inner:.4f}]; "
-            "CI=[{ci_lo:.4f}, {ci_hi:.4f}]".format(**row)
-            for row in manifest["completed_runs"]
+            [
+                "",
+                "completed evaluation diagnostics (fixed-label pooled-window Macro-F1; "
+                "descriptive cluster-bootstrap CI):",
+            ]
         )
+        for row in manifest["completed_runs"]:
+            matrix_text = json.dumps(row["confusion_matrix"], separators=(",", ":"))
+            histogram_text = json.dumps(
+                row["predicted_class_histogram"], sort_keys=True, separators=(",", ":")
+            )
+            lines.append(
+                f"- {row['representation']} seed={row['seed']} view={row['view']}: "
+                f"test Macro-F1={row['macro_f1']:.4f}; "
+                f"train/validation Macro-F1={row['train_macro_f1']:.4f}/"
+                f"{row['validation_macro_f1']:.4f}; "
+                f"majority baseline Macro-F1={row['majority_class_baseline_macro_f1']:.4f} "
+                f"(class {row['majority_class_baseline_class']}); "
+                f"uniform-random MC mean Macro-F1="
+                f"{row['uniform_random_baseline_macro_f1_mc']:.4f} "
+                f"(n={row['uniform_random_baseline_draws']}, "
+                f"seed={row['uniform_random_baseline_seed']}); "
+                f"confusion labels=[0,1,2]={matrix_text}; "
+                f"predicted-class histogram={histogram_text}; "
+                f"cluster-bootstrap CI=[{row['ci_lo']:.4f}, {row['ci_hi']:.4f}]"
+            )
     if manifest.get("failed_runs"):
         lines.extend(["", "failed combinations:"])
         lines.extend(
@@ -1019,6 +1079,184 @@ def normalize_partitions(
     return X_train_z, X_validation_z, X_tests_z, mean, std
 
 
+def _fixed_label_macro_f1(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute the existing Macro-F1 definition over the fixed Stage 1 labels."""
+    from sklearn.metrics import f1_score
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if y_true.ndim != 1 or y_pred.ndim != 1 or y_true.shape != y_pred.shape:
+        raise Stage1RunError("fixed-label Macro-F1 inputs must be aligned 1-D arrays")
+    if y_true.size == 0:
+        raise Stage1RunError("fixed-label Macro-F1 inputs must be non-empty")
+    if not np.isin(y_true, FIXED_LABELS).all():
+        raise Stage1RunError("fixed-label Macro-F1 y_true contains an unexpected label")
+    if not np.isin(y_pred, FIXED_LABELS).all():
+        raise Stage1RunError("fixed-label Macro-F1 y_pred contains an unexpected label")
+    return float(
+        f1_score(
+            y_true,
+            y_pred,
+            average="macro",
+            labels=list(FIXED_LABELS),
+            zero_division=0,
+        )
+    )
+
+
+def _fixed_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> list[list[int]]:
+    """Return a fixed [0,1,2] confusion matrix with rows=true, columns=predicted."""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if y_true.ndim != 1 or y_pred.ndim != 1 or y_true.shape != y_pred.shape:
+        raise Stage1RunError("confusion-matrix inputs must be aligned 1-D arrays")
+    if not np.isin(y_true, FIXED_LABELS).all():
+        raise Stage1RunError("confusion-matrix y_true contains an unexpected label")
+    if not np.isin(y_pred, FIXED_LABELS).all():
+        raise Stage1RunError("confusion-matrix y_pred contains an unexpected label")
+    matrix = np.zeros((len(FIXED_LABELS), len(FIXED_LABELS)), dtype=np.int64)
+    np.add.at(matrix, (y_true.astype(np.int64), y_pred.astype(np.int64)), 1)
+    return matrix.tolist()
+
+
+def _macro_f1_from_confusion_matrix(confusion: np.ndarray) -> float:
+    """Equivalent fixed-label Macro-F1 from a 3x3 true-row/predicted-column matrix."""
+    confusion = np.asarray(confusion, dtype=np.int64)
+    if confusion.shape != (len(FIXED_LABELS), len(FIXED_LABELS)):
+        raise Stage1RunError("fixed-label confusion matrix must be 3x3")
+    true_support = confusion.sum(axis=1).astype(np.float64)
+    predicted_support = confusion.sum(axis=0).astype(np.float64)
+    denominator = true_support + predicted_support
+    class_f1 = np.divide(
+        2.0 * np.diag(confusion),
+        denominator,
+        out=np.zeros(len(FIXED_LABELS), dtype=np.float64),
+        where=denominator > 0,
+    )
+    return float(class_f1.mean())
+
+
+def _predicted_class_histogram(y_pred: np.ndarray) -> dict[str, int]:
+    y_pred = np.asarray(y_pred)
+    if y_pred.ndim != 1 or not np.isin(y_pred, FIXED_LABELS).all():
+        raise Stage1RunError("predicted labels must be a 1-D array over fixed labels [0,1,2]")
+    counts = np.bincount(y_pred.astype(np.int64), minlength=len(FIXED_LABELS))
+    return {str(label): int(counts[label]) for label in FIXED_LABELS}
+
+
+def _compute_view_baselines(y_true: np.ndarray) -> dict[str, Any]:
+    """Compute deterministic majority and uniform-random baselines for one view."""
+    y_true = np.asarray(y_true)
+    if y_true.ndim != 1 or y_true.size == 0:
+        raise Stage1RunError("evaluation-view labels must be a non-empty 1-D array")
+    if not np.isin(y_true, FIXED_LABELS).all():
+        raise Stage1RunError("evaluation-view labels contain an unexpected class")
+
+    class_counts = np.bincount(y_true.astype(np.int64), minlength=len(FIXED_LABELS))
+    # np.argmax deterministically breaks ties in favor of the lowest fixed label.
+    majority_class = int(np.argmax(class_counts))
+    majority_predictions = np.full(y_true.shape, majority_class, dtype=np.int64)
+    majority_score = _fixed_label_macro_f1(y_true, majority_predictions)
+
+    rng = np.random.RandomState(UNIFORM_RANDOM_BASELINE_SEED)
+    random_scores = np.empty(UNIFORM_RANDOM_BASELINE_DRAWS, dtype=np.float64)
+    true_labels = y_true.astype(np.int64, copy=False)
+    true_support = np.bincount(
+        true_labels, minlength=len(FIXED_LABELS)
+    ).astype(np.float64)
+    for start in range(
+        0, UNIFORM_RANDOM_BASELINE_DRAWS, UNIFORM_RANDOM_BASELINE_CHUNK_SIZE
+    ):
+        stop = min(
+            start + UNIFORM_RANDOM_BASELINE_CHUNK_SIZE,
+            UNIFORM_RANDOM_BASELINE_DRAWS,
+        )
+        random_predictions = rng.randint(
+            0,
+            len(FIXED_LABELS),
+            size=(stop - start, y_true.size),
+            dtype=np.int8,
+        )
+        predicted_support = np.stack(
+            [np.count_nonzero(random_predictions == label, axis=1) for label in FIXED_LABELS],
+            axis=1,
+        ).astype(np.float64)
+        true_positive = np.stack(
+            [
+                np.count_nonzero(
+                    (random_predictions == label)
+                    & (true_labels[None, :] == label),
+                    axis=1,
+                )
+                for label in FIXED_LABELS
+            ],
+            axis=1,
+        ).astype(np.float64)
+        denominator = true_support[None, :] + predicted_support
+        class_f1 = np.divide(
+            2.0 * true_positive,
+            denominator,
+            out=np.zeros_like(denominator),
+            where=denominator > 0,
+        )
+        random_scores[start:stop] = class_f1.mean(axis=1)
+    return {
+        "majority_class": majority_class,
+        "majority_class_support": int(class_counts[majority_class]),
+        "majority_class_macro_f1": majority_score,
+        "uniform_random_macro_f1_mc": float(random_scores.mean()),
+        "uniform_random_draws": UNIFORM_RANDOM_BASELINE_DRAWS,
+        "uniform_random_seed": UNIFORM_RANDOM_BASELINE_SEED,
+        "uniform_random_seed_algorithm": "numpy.random.RandomState (MT19937)",
+    }
+
+
+def _window_recording_ids(ds: Any) -> np.ndarray:
+    """Return the loader's per-window recording IDs in dataset row order."""
+    metadata = getattr(ds, "window_metadata", None)
+    labels = np.asarray(ds.labels)
+    if metadata is None or len(metadata) != labels.shape[0]:
+        raise Stage1RunError(
+            "window_metadata must contain one recording_id entry per loaded window"
+        )
+    recording_ids: list[str] = []
+    for index, row in enumerate(metadata):
+        if not isinstance(row, Mapping) or row.get("recording_id") in (None, ""):
+            raise Stage1RunError(
+                f"window_metadata row {index} is missing its recording_id"
+            )
+        recording_ids.append(str(row["recording_id"]))
+    return np.asarray(recording_ids, dtype=object)
+
+
+def _evaluation_diagnostics_spec() -> dict[str, Any]:
+    return {
+        "fixed_labels": list(FIXED_LABELS),
+        "zero_division": 0,
+        "confusion_matrix_orientation": "rows=true labels; columns=predicted labels",
+        "majority_baseline": (
+            "predict the most frequent y_true class in each evaluation view; "
+            "ties resolve to the smallest fixed label"
+        ),
+        "uniform_random_baseline": {
+            "estimate": "Monte Carlo mean Macro-F1; not an exact theoretical value",
+            "draws_per_view": UNIFORM_RANDOM_BASELINE_DRAWS,
+            "prediction_distribution": "independent uniform draws from [0,1,2]",
+            "rng": "numpy.random.RandomState (MT19937)",
+            "fixed_seed": UNIFORM_RANDOM_BASELINE_SEED,
+            "seed_reinitialized_for_each_view": True,
+            "draw_processing": (
+                f"chunked by {UNIFORM_RANDOM_BASELINE_CHUNK_SIZE} prediction vectors "
+                "to bound memory"
+            ),
+        },
+        "train_validation_macro_f1": (
+            "final restored model predictions on normalized X_train_z and "
+            "X_validation_z, using fixed labels [0,1,2] and zero_division=0"
+        ),
+    }
+
+
 def _labels_for_partition(
     labels: np.ndarray,
     partition_name: str,
@@ -1281,6 +1519,7 @@ def _new_manifest(args: argparse.Namespace, run_id: str, paths: Mapping[str, Pat
             "entire final incomplete batch, and requires at least one complete batch."
         ),
         "uncertainty_note": "Cluster-bootstrap intervals are descriptive only and resample physical_bearing_uids.",
+        "evaluation_diagnostics": _evaluation_diagnostics_spec(),
         "coverage_evidence_note": (
             "Filename coverage verifies names and required bearing-condition pairs only; "
             "it does not verify MAT signal content, channels, sampling rate, signal length, or usable windows."
@@ -1296,6 +1535,7 @@ def _new_manifest(args: argparse.Namespace, run_id: str, paths: Mapping[str, Pat
         "loaded_files": [],
         "loaded_file_count": 0,
         "loaded_file_list_sha256": None,
+        "per_window_prediction_row_count": 0,
         "excluded_file_count": 0,
         "excluded_recordings": [],
         "recording_exclusion_log": [],
@@ -1309,6 +1549,7 @@ def _new_manifest(args: argparse.Namespace, run_id: str, paths: Mapping[str, Pat
         "memory_guard": None,
         "partition_counts": None,
         "planned_runs": [],
+        "view_baseline_diagnostics": {},
         "completed_runs": [],
         "failed_runs": [],
         "skipped_runs": [],
@@ -1316,20 +1557,49 @@ def _new_manifest(args: argparse.Namespace, run_id: str, paths: Mapping[str, Pat
     }
 
 
-def _initialise_output_files(out_dir: Path) -> tuple[str, dict[str, Path], Any, Any]:
+def _initialise_output_files(
+    out_dir: Path,
+) -> tuple[str, dict[str, Path], Any, Any, Any, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_id = _run_id()
     paths = {
         "results_csv": out_dir / f"stage1_results_{run_id}.csv",
+        "predictions_csv": out_dir / f"stage1_predictions_{run_id}.csv",
         "run_manifest": out_dir / f"stage1_manifest_{run_id}.json",
         "summary": out_dir / f"stage1_summary_{run_id}.txt",
     }
     results_stream = paths["results_csv"].open("x", newline="", encoding="utf-8")
-    writer = csv.DictWriter(results_stream, fieldnames=RESULT_COLUMNS, extrasaction="raise")
-    writer.writeheader()
+    try:
+        predictions_stream = paths["predictions_csv"].open(
+            "x", newline="", encoding="utf-8"
+        )
+    except Exception:
+        results_stream.close()
+        raise
+
+    results_writer = csv.DictWriter(
+        results_stream, fieldnames=RESULT_COLUMNS, extrasaction="raise"
+    )
+    results_writer.writeheader()
     results_stream.flush()
     os.fsync(results_stream.fileno())
-    return run_id, paths, results_stream, writer
+
+    predictions_writer = csv.DictWriter(
+        predictions_stream,
+        fieldnames=PREDICTION_COLUMNS,
+        extrasaction="raise",
+    )
+    predictions_writer.writeheader()
+    predictions_stream.flush()
+    os.fsync(predictions_stream.fileno())
+    return (
+        run_id,
+        paths,
+        results_stream,
+        results_writer,
+        predictions_stream,
+        predictions_writer,
+    )
 
 
 def _timestamp_for_row() -> str:
@@ -1338,7 +1608,14 @@ def _timestamp_for_row() -> str:
 
 def run_stage1(args: argparse.Namespace) -> int:
     """Execute or dry-run the Stage 1 protocol and persist an auditable bundle."""
-    run_id, output_paths, results_stream, csv_writer = _initialise_output_files(args.out_dir)
+    (
+        run_id,
+        output_paths,
+        results_stream,
+        csv_writer,
+        predictions_stream,
+        predictions_writer,
+    ) = _initialise_output_files(args.out_dir)
     manifest = _new_manifest(args, run_id, output_paths)
     phase = "INITIAL_PREFLIGHT"
     secondary_inventory_present = False
@@ -1655,6 +1932,8 @@ def run_stage1(args: argparse.Namespace) -> int:
         masks = _partition_masks(ds)
         dataset_physical = np.asarray(ds.physical_bearing_uids, dtype=object)
         dataset_labels = np.asarray(ds.labels)
+        dataset_conditions = np.asarray(ds.condition_codes, dtype=object)
+        dataset_recording_ids = _window_recording_ids(ds)
         manifest["partition_counts"] = {
             view: {
                 "n_windows": int(masks[view].sum()),
@@ -1705,6 +1984,18 @@ def run_stage1(args: argparse.Namespace) -> int:
         persist()
         train_api = _load_training_api()
         evaluation_api = _load_evaluation_api()
+        view_baselines: dict[str, dict[str, Any]] = {}
+        for view, indices in test_views.items():
+            view_labels = dataset_labels[indices]
+            baseline = _compute_view_baselines(view_labels)
+            baseline["n_samples"] = int(view_labels.size)
+            baseline["y_true_class_histogram"] = {
+                str(label): int(np.count_nonzero(view_labels == label))
+                for label in FIXED_LABELS
+            }
+            view_baselines[view] = baseline
+        manifest["view_baseline_diagnostics"] = view_baselines
+        persist()
         with (_EXPERIMENT_ROOT / "config" / "experiment_config.json").open(
             "r", encoding="utf-8"
         ) as stream:
@@ -1765,6 +2056,19 @@ def run_stage1(args: argparse.Namespace) -> int:
                         class_weights=class_weights,
                         drop_last_train=True,
                     )
+                    # train_one_fold returns the restored best-validation-loss model.
+                    train_predictions = np.asarray(
+                        train_api.predict(model, X_train_z), dtype=np.int64
+                    )
+                    validation_predictions = np.asarray(
+                        train_api.predict(model, X_validation_z), dtype=np.int64
+                    )
+                    train_macro_f1 = _fixed_label_macro_f1(
+                        y_train, train_predictions
+                    )
+                    validation_macro_f1 = _fixed_label_macro_f1(
+                        y_validation, validation_predictions
+                    )
                 except Exception as exc:
                     for view in test_views:
                         manifest["failed_runs"].append(
@@ -1778,8 +2082,10 @@ def run_stage1(args: argparse.Namespace) -> int:
                     continue
 
                 for view, indices in test_views.items():
-                    view_labels = np.asarray(ds.labels)[indices]
-                    view_physical_uids = np.asarray(ds.physical_bearing_uids, dtype=object)[indices]
+                    view_labels = dataset_labels[indices]
+                    view_physical_uids = dataset_physical[indices]
+                    view_conditions = dataset_conditions[indices]
+                    view_recording_ids = dataset_recording_ids[indices]
                     try:
                         prediction = np.asarray(
                             train_api.predict(model, X_tests_z[view]), dtype=np.int64
@@ -1788,6 +2094,8 @@ def run_stage1(args: argparse.Namespace) -> int:
                             raise Stage1RunError(
                                 f"{view} prediction shape {prediction.shape} does not match labels {view_labels.shape}"
                             )
+                        confusion = _fixed_confusion_matrix(view_labels, prediction)
+                        predicted_histogram = _predicted_class_histogram(prediction)
                         macro = evaluation_api.macro_f1(
                             view_labels,
                             prediction,
@@ -1807,6 +2115,34 @@ def run_stage1(args: argparse.Namespace) -> int:
                             seed=seed,
                             labels=list(FIXED_LABELS),
                         )
+
+                        prediction_rows = [
+                            {
+                                "representation": representation,
+                                "seed": int(seed),
+                                "view": view,
+                                "y_true": int(y_true),
+                                "y_pred": int(y_pred),
+                                "physical_bearing_uid": str(physical_uid),
+                                "condition": str(condition),
+                                "recording_id": str(recording_id),
+                            }
+                            for y_true, y_pred, physical_uid, condition, recording_id in zip(
+                                view_labels,
+                                prediction,
+                                view_physical_uids,
+                                view_conditions,
+                                view_recording_ids,
+                            )
+                        ]
+                        predictions_writer.writerows(prediction_rows)
+                        predictions_stream.flush()
+                        os.fsync(predictions_stream.fileno())
+                        manifest["per_window_prediction_row_count"] += len(
+                            prediction_rows
+                        )
+
+                        baseline = view_baselines[view]
                         row = {
                             "representation": representation,
                             "seed": seed,
@@ -1822,8 +2158,40 @@ def run_stage1(args: argparse.Namespace) -> int:
                             "ci_hi": float(ci_hi),
                             "class_weights_used": not args.no_class_weights,
                             "timestamp": _timestamp_for_row(),
+                            "confusion_matrix_labels": list(FIXED_LABELS),
+                            "confusion_matrix": confusion,
+                            "predicted_class_histogram": predicted_histogram,
+                            "majority_class_baseline_class": baseline["majority_class"],
+                            "majority_class_baseline_macro_f1": baseline[
+                                "majority_class_macro_f1"
+                            ],
+                            "uniform_random_baseline_macro_f1_mc": baseline[
+                                "uniform_random_macro_f1_mc"
+                            ],
+                            "uniform_random_baseline_draws": baseline[
+                                "uniform_random_draws"
+                            ],
+                            "uniform_random_baseline_seed": baseline[
+                                "uniform_random_seed"
+                            ],
+                            "train_macro_f1": train_macro_f1,
+                            "validation_macro_f1": validation_macro_f1,
+                            "prediction_file": str(output_paths["predictions_csv"]),
+                            "prediction_row_count": int(len(prediction_rows)),
                         }
-                        csv_writer.writerow(row)
+                        csv_row = dict(row)
+                        csv_row["confusion_matrix_labels"] = json.dumps(
+                            row["confusion_matrix_labels"], separators=(",", ":")
+                        )
+                        csv_row["confusion_matrix"] = json.dumps(
+                            row["confusion_matrix"], separators=(",", ":")
+                        )
+                        csv_row["predicted_class_histogram"] = json.dumps(
+                            row["predicted_class_histogram"],
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        csv_writer.writerow(csv_row)
                         results_stream.flush()
                         os.fsync(results_stream.fileno())
                         manifest["completed_runs"].append(row)
@@ -1956,6 +2324,8 @@ def run_stage1(args: argparse.Namespace) -> int:
     finally:
         results_stream.flush()
         results_stream.close()
+        predictions_stream.flush()
+        predictions_stream.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

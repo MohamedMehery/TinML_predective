@@ -80,6 +80,7 @@ def _make_fake_dataset(*, include_secondary: bool = True, secondary_single_class
     conditions: list[str] = []
     labels: list[int] = []
     recording_uids: list[str] = []
+    window_metadata: list[dict[str, str]] = []
 
     for allocation_name in ("train", "validation"):
         condition = split["conditions"][allocation_name]
@@ -88,6 +89,13 @@ def _make_fake_dataset(*, include_secondary: bool = True, secondary_single_class
             conditions.append(condition)
             labels.append(int(class_map[bearing]["label"]))
             recording_uids.append(f"recording::{condition}::{bearing}::1")
+            window_metadata.append(
+                {
+                    "recording_id": "1",
+                    "condition_code": condition,
+                    "physical_bearing_uid": bearing,
+                }
+            )
 
     test_views = ("test_in_condition", "test_primary")
     if include_secondary:
@@ -102,6 +110,13 @@ def _make_fake_dataset(*, include_secondary: bool = True, secondary_single_class
                 label = 0
             labels.append(label)
             recording_uids.append(f"recording::{condition}::{bearing}::1")
+            window_metadata.append(
+                {
+                    "recording_id": "1",
+                    "condition_code": condition,
+                    "physical_bearing_uid": bearing,
+                }
+            )
 
     n_rows = len(labels)
     row = np.arange(n_rows, dtype=np.float32)
@@ -119,6 +134,7 @@ def _make_fake_dataset(*, include_secondary: bool = True, secondary_single_class
         r2_raw=(features + 20.0).copy(),
         r2_env=(features + 30.0).copy(),
         r3_order=(features + 40.0).copy(),
+        window_metadata=window_metadata,
         recording_exclusion_log=[],
     )
 
@@ -131,6 +147,7 @@ def _install_fakes(monkeypatch, dataset):
         "macro_labels": [],
         "per_class_labels": [],
         "bootstrap_calls": [],
+        "prediction_calls": [],
     }
 
     def load_real(paths, *, exclude_combined):
@@ -156,7 +173,9 @@ def _install_fakes(monkeypatch, dataset):
         return object()
 
     def predict(_model, X):
-        return np.zeros(np.asarray(X).shape[0], dtype=np.int64)
+        X = np.asarray(X)
+        traces["prediction_calls"].append(X.copy())
+        return np.zeros(X.shape[0], dtype=np.int64)
 
     def macro_f1(y_true, y_pred, *, labels=None):
         traces["macro_labels"].append(tuple(labels) if labels is not None else None)
@@ -232,6 +251,57 @@ def _read_outputs(out: Path):
         rows = list(csv.DictReader(stream))
     summary = summary_path.read_text(encoding="utf-8")
     return manifest, rows, summary
+
+
+def _read_prediction_rows(out: Path):
+    predictions_path = next(out.glob("stage1_predictions_*.csv"))
+    with predictions_path.open("r", newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    return predictions_path, rows
+
+
+def _reference_uniform_random_macro_f1_mc(y_true: np.ndarray) -> float:
+    from sklearn.metrics import f1_score
+
+    rng = np.random.RandomState(RUN.UNIFORM_RANDOM_BASELINE_SEED)
+    predictions = np.concatenate(
+        [
+            rng.randint(
+                0,
+                len(RUN.FIXED_LABELS),
+                size=(
+                    min(
+                        RUN.UNIFORM_RANDOM_BASELINE_CHUNK_SIZE,
+                        RUN.UNIFORM_RANDOM_BASELINE_DRAWS - start,
+                    ),
+                    y_true.size,
+                ),
+                dtype=np.int8,
+            )
+            for start in range(
+                0,
+                RUN.UNIFORM_RANDOM_BASELINE_DRAWS,
+                RUN.UNIFORM_RANDOM_BASELINE_CHUNK_SIZE,
+            )
+        ],
+        axis=0,
+    )
+    class_indicators = np.eye(len(RUN.FIXED_LABELS), dtype=np.uint8)
+    predicted_indicators = class_indicators[predictions].transpose(1, 0, 2).reshape(
+        y_true.size, -1
+    )
+    true_indicators = np.broadcast_to(
+        class_indicators[y_true.astype(np.int64)][:, None, :],
+        (y_true.size, RUN.UNIFORM_RANDOM_BASELINE_DRAWS, len(RUN.FIXED_LABELS)),
+    ).reshape(y_true.size, -1)
+    return float(
+        f1_score(
+            true_indicators,
+            predicted_indicators,
+            average="macro",
+            zero_division=0,
+        )
+    )
 
 
 def test_dry_run_scans_exact_inventory_and_never_loads_or_trains(tmp_path, monkeypatch):
@@ -1010,3 +1080,191 @@ def test_gate_flag_dry_run_skips_all_mat_loading_and_defers_cap(tmp_path, monkey
     assert "gate_prevalidation_skipped: dry-run; no MAT files were opened" in summary
     assert "recording cap not applied in dry-run" in summary
     assert "timing_irregularity_cause: unknown" in summary
+
+
+def test_fixed_label_diagnostics_and_per_window_prediction_csv(tmp_path, monkeypatch):
+    from sklearn.metrics import f1_score
+
+    root = tmp_path / "data"
+    _make_inventory(root, include_secondary=True)
+    dataset = _make_fake_dataset(include_secondary=True)
+    traces = _install_fakes(monkeypatch, dataset)
+    out = tmp_path / "out"
+
+    code = RUN.main(
+        _run_args(
+            root,
+            out,
+            reps="R1_Raw,R3_Order",
+            seeds="42,7",
+        )
+    )
+
+    assert code == 0
+    manifest, result_rows, summary = _read_outputs(out)
+    prediction_path, prediction_rows = _read_prediction_rows(out)
+    assert prediction_path.parent == out
+    assert manifest["output_files"]["predictions_csv"] == str(prediction_path)
+    assert manifest["per_window_prediction_row_count"] == len(prediction_rows)
+    assert set(prediction_rows[0]) == set(RUN.PREDICTION_COLUMNS)
+    assert len(manifest["completed_runs"]) == 2 * 2 * 3
+
+    diagnostic_spec = manifest["evaluation_diagnostics"]
+    assert diagnostic_spec["fixed_labels"] == [0, 1, 2]
+    assert diagnostic_spec["zero_division"] == 0
+    random_spec = diagnostic_spec["uniform_random_baseline"]
+    assert random_spec["estimate"].startswith("Monte Carlo mean")
+    assert random_spec["draws_per_view"] == 10_000
+    assert random_spec["fixed_seed"] == RUN.UNIFORM_RANDOM_BASELINE_SEED
+    assert random_spec["seed_reinitialized_for_each_view"] is True
+
+    expected_prediction_rows = 0
+    expected_baselines = {}
+    for view in RUN.EVALUATION_VIEWS:
+        mask = S.partition_mask(
+            dataset.physical_bearing_uids,
+            dataset.condition_codes,
+            view,
+        )
+        y_true = dataset.labels[mask]
+        expected_prediction_rows += int(mask.sum()) * 2 * 2
+        class_counts = np.bincount(y_true, minlength=3)
+        majority_class = int(np.argmax(class_counts))
+        majority_predictions = np.full(y_true.shape, majority_class, dtype=np.int64)
+        expected_majority_macro = f1_score(
+            y_true,
+            majority_predictions,
+            average="macro",
+            labels=[0, 1, 2],
+            zero_division=0,
+        )
+        view_baseline = manifest["view_baseline_diagnostics"][view]
+        assert view_baseline["n_samples"] == int(mask.sum())
+        assert view_baseline["majority_class"] == majority_class
+        assert view_baseline["majority_class_macro_f1"] == pytest.approx(
+            expected_majority_macro
+        )
+        assert view_baseline["uniform_random_draws"] == 10_000
+        assert view_baseline["uniform_random_seed"] == RUN.UNIFORM_RANDOM_BASELINE_SEED
+        assert 0.0 <= view_baseline["uniform_random_macro_f1_mc"] <= 1.0
+        if view == RUN.EVALUATION_VIEWS[0]:
+            assert view_baseline["uniform_random_macro_f1_mc"] == pytest.approx(
+                _reference_uniform_random_macro_f1_mc(y_true)
+            )
+        expected_baselines[view] = view_baseline
+
+        # Re-seeding per view must make the Monte Carlo estimate reproducible.
+        assert RUN._compute_view_baselines(y_true) == {
+            key: value
+            for key, value in view_baseline.items()
+            if key not in {"n_samples", "y_true_class_histogram"}
+        }
+
+    assert len(prediction_rows) == expected_prediction_rows
+    rows_by_key = {
+        (row["representation"], int(row["seed"]), row["view"]): row
+        for row in prediction_rows
+    }
+    for row in manifest["completed_runs"]:
+        key = (row["representation"], row["seed"], row["view"])
+        view = row["view"]
+        mask = S.partition_mask(
+            dataset.physical_bearing_uids,
+            dataset.condition_codes,
+            view,
+        )
+        y_true = dataset.labels[mask]
+        y_pred = np.zeros(y_true.shape, dtype=np.int64)
+        expected_confusion = np.zeros((3, 3), dtype=np.int64)
+        np.add.at(expected_confusion, (y_true, y_pred), 1)
+        assert RUN._macro_f1_from_confusion_matrix(expected_confusion) == pytest.approx(
+            f1_score(
+                y_true,
+                y_pred,
+                average="macro",
+                labels=[0, 1, 2],
+                zero_division=0,
+            )
+        )
+        assert row["confusion_matrix_labels"] == [0, 1, 2]
+        assert row["confusion_matrix"] == expected_confusion.tolist()
+        assert row["predicted_class_histogram"] == {
+            "0": int(y_true.size), "1": 0, "2": 0
+        }
+        baseline = expected_baselines[view]
+        assert row["majority_class_baseline_class"] == baseline["majority_class"]
+        assert row["majority_class_baseline_macro_f1"] == pytest.approx(
+            baseline["majority_class_macro_f1"]
+        )
+        assert row["uniform_random_baseline_macro_f1_mc"] == pytest.approx(
+            baseline["uniform_random_macro_f1_mc"]
+        )
+        assert row["uniform_random_baseline_draws"] == 10_000
+        assert row["uniform_random_baseline_seed"] == RUN.UNIFORM_RANDOM_BASELINE_SEED
+
+        train_mask = S.partition_mask(
+            dataset.physical_bearing_uids,
+            dataset.condition_codes,
+            "train",
+        )
+        validation_mask = S.partition_mask(
+            dataset.physical_bearing_uids,
+            dataset.condition_codes,
+            "validation",
+        )
+        expected_train_macro = f1_score(
+            dataset.labels[train_mask],
+            np.zeros(int(train_mask.sum()), dtype=np.int64),
+            average="macro",
+            labels=[0, 1, 2],
+            zero_division=0,
+        )
+        expected_validation_macro = f1_score(
+            dataset.labels[validation_mask],
+            np.zeros(int(validation_mask.sum()), dtype=np.int64),
+            average="macro",
+            labels=[0, 1, 2],
+            zero_division=0,
+        )
+        assert row["train_macro_f1"] == pytest.approx(expected_train_macro)
+        assert row["validation_macro_f1"] == pytest.approx(expected_validation_macro)
+        assert row["prediction_file"] == str(prediction_path)
+        assert row["prediction_row_count"] == int(mask.sum())
+
+        matching_predictions = [
+            prediction
+            for prediction in prediction_rows
+            if (prediction["representation"], int(prediction["seed"]), prediction["view"])
+            == key
+        ]
+        assert len(matching_predictions) == int(mask.sum())
+        assert [int(prediction["y_true"]) for prediction in matching_predictions] == y_true.tolist()
+        assert all(int(prediction["y_pred"]) == 0 for prediction in matching_predictions)
+        assert [prediction["physical_bearing_uid"] for prediction in matching_predictions] == (
+            dataset.physical_bearing_uids[mask].tolist()
+        )
+        assert [prediction["condition"] for prediction in matching_predictions] == (
+            dataset.condition_codes[mask].tolist()
+        )
+        assert {prediction["recording_id"] for prediction in matching_predictions} == {"1"}
+
+    assert set(rows_by_key) == {
+        (row["representation"], row["seed"], row["view"])
+        for row in manifest["completed_runs"]
+    }
+    assert len(result_rows) == len(manifest["completed_runs"])
+    assert json.loads(result_rows[0]["confusion_matrix_labels"]) == [0, 1, 2]
+    assert json.loads(result_rows[0]["confusion_matrix"]) == manifest["completed_runs"][0][
+        "confusion_matrix"
+    ]
+    assert "Uniform-random baseline is a Monte Carlo mean" in summary
+    assert "confusion labels=[0,1,2]" in summary
+    assert "train/validation Macro-F1=" in summary
+    assert "per_window_predictions_file:" in summary
+    # The first two predictions after each training call are on normalized train/validation arrays.
+    np.testing.assert_array_equal(
+        traces["prediction_calls"][0], traces["train_calls"][0]["X_train"]
+    )
+    np.testing.assert_array_equal(
+        traces["prediction_calls"][1], traces["train_calls"][0]["X_val"]
+    )
