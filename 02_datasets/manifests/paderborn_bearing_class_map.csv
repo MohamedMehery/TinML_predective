@@ -1,0 +1,33 @@
+bearing_id,class_name,label,damage_origin,source_table,source_component,source_combination,extent_level,stage1_status
+K001,Healthy,0,healthy,Table 7,n/a,n/a,n/a,include
+K002,Healthy,0,healthy,Table 7,n/a,n/a,n/a,include
+K003,Healthy,0,healthy,Table 7,n/a,n/a,n/a,include
+K004,Healthy,0,healthy,Table 7,n/a,n/a,n/a,include
+K005,Healthy,0,healthy,Table 7,n/a,n/a,n/a,include
+K006,Healthy,0,healthy,Table 7,n/a,n/a,n/a,include
+KA01,Outer_Race,1,artificial,Table 4,OR,single point,L1,include
+KA03,Outer_Race,1,artificial,Table 4,OR,single point,L2,include
+KA05,Outer_Race,1,artificial,Table 4,OR,single point,L1,include
+KA06,Outer_Race,1,artificial,Table 4,OR,single point,L2,include
+KA07,Outer_Race,1,artificial,Table 4,OR,single point,L1,include
+KA08,Outer_Race,1,artificial,Table 4,OR,single point,L2,include
+KA09,Outer_Race,1,artificial,Table 4,OR,single point,L2,include
+KI01,Inner_Race,2,artificial,Table 4,IR,single point,L1,include
+KI03,Inner_Race,2,artificial,Table 4,IR,single point,L1,include
+KI05,Inner_Race,2,artificial,Table 4,IR,single point,L1,include
+KI07,Inner_Race,2,artificial,Table 4,IR,single point,L2,include
+KI08,Inner_Race,2,artificial,Table 4,IR,single point,L2,include
+KA04,Outer_Race,1,real,Table 5,OR,S,L1,include
+KA15,Outer_Race,1,real,Table 5,OR,S,L1,include
+KA16,Outer_Race,1,real,Table 5,OR,R,L2,include
+KA22,Outer_Race,1,real,Table 5,OR,S,L1,include
+KA30,Outer_Race,1,real,Table 5,OR,R,L1,include
+KI04,Inner_Race,2,real,Table 5,IR,M,L1,include
+KI14,Inner_Race,2,real,Table 5,IR,M,L1,include
+KI16,Inner_Race,2,real,Table 5,IR,S,L3,include
+KI17,Inner_Race,2,real,Table 5,IR,R,L1,include
+KI18,Inner_Race,2,real,Table 5,IR,S,L2,include
+KI21,Inner_Race,2,real,Table 5,IR,S,L1,include
+KB23,Combined,-1,real,Table 5,IR (+OR),M,L2,exclude
+KB24,Combined,-1,real,Table 5,IR (+OR),M,L3,exclude
+KB27,Combined,-1,real,Table 5,OR + IR,M,L1,exclude
